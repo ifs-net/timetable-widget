@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+data/*.csv
+logs/logfile.txt
+config.yaml
+.env
+.codex/
+temp_backups/
