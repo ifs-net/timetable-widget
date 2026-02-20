@@ -1,8 +1,0 @@
-fatal: detected dubious ownership in repository at '//nas-keller/docker/timetable-widget'
-'//nas-keller/docker/timetable-widget' is owned by:
-	(inconvertible) (S-1-5-21-2971254183-1335333748-934439225-3052)
-but the current user is:
-	DESKTOP-N8UDP1I/flo (S-1-5-21-889966853-2501632292-1536272179-1001)
-To add an exception for this directory, call:
-
-	git config --global --add safe.directory '%(prefix)///nas-keller/docker/timetable-widget'
