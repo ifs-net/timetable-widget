@@ -514,7 +514,7 @@ def load_trip_route_map_from_static_gtfs(
 
             if not trip_ids:
                 debug_log("mapping_fallback:no_trips_for_configured_stop_ids")
-                return {}, {}, "mapping fallback: keine Trips fuer konfigurierte stop_ids gefunden"
+                return {}, {}, "mapping fallback: keine Trips für konfigurierte stop_ids gefunden"
 
             trips_started = time.monotonic()
             trip_to_route_id: dict[str, str] = {}
@@ -1378,10 +1378,10 @@ async def poll_once(state: RuntimeState) -> None:
                 if mapping_error:
                     widget_errors.append(mapping_error)
                 if not widget.stop_ids:
-                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer moeglich.")
+                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer möglich.")
                 if widget.route_short_names and not route_map:
                     widget_errors.append(
-                        f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfuegbar."
+                        f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfügbar."
                     )
                 for stop_id in widget.stop_ids:
                     if stop_id in missing_stop_ids:
@@ -2013,6 +2013,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
