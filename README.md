@@ -4,7 +4,7 @@ Container-Projekt für ein konfigurierbares Abfahrts-Widget (HTML) plus JSON-End
 
 Konkret integriert werden sollten für meinen Fall Bahnverbindungen eines nahen Bahnhofs Richtung Regensburg Zentrum sowie die Abfahrtszeiten und Live-Daten zu den Busverbindungen des RVV (Regensburger Verkehrsverbunds) zweier Haltestellen nahe meines Wohnorts.
 
-Die L?sung ist aber nicht auf den RVV beschr?nkt, sondern universell einsetzbar f?r alle in den genutzten Quellen enthaltenen Verkehrsverb?nde.
+Die Lösung ist aber nicht auf den RVV beschränkt, sondern universell einsetzbar für alle in den genutzten Quellen enthaltenen Verkehrsverb?nde.
 
 ## Setup
 
