@@ -12,8 +12,8 @@ widgets:
     title: "Dechbetten/TELIS FINANZ"
     source: "gtfs_rt"
     stop_ids:
-      - "122010"  # Dechbetten/TELIS FINANZ Richtung Lilienthalstraße/Dechbetten
-      - "36191"   # Dechbetten/TELIS FINANZ Richtung Schwalbenneststraße
+      - "27741"   # Dechbetten/TELIS FINANZ (aktive Richtung 1, Regensburg)
+      - "647898"  # Dechbetten/TELIS FINANZ (aktive Richtung 2, Regensburg)
     gtfs_lookahead_hours: 24
     max_departures: 8
     show_delay: true
@@ -35,8 +35,9 @@ widgets:
     title: "Lilienthalstraße"
     source: "gtfs_rt"
     stop_ids:
-      - "641545"  # Lilienthalstraße (Richtung A)
-      - "649599"  # Lilienthalstraße (Richtung B)
+      - "406702"  # Lilienthalstraße (Regensburg, Richtung A)
+      - "8593"    # Lilienthalstraße (Regensburg, Richtung B)
+      - "86805"   # Lilienthalstraße (Regensburg, weitere Steig-/Richtungs-ID)
     gtfs_lookahead_hours: 24
     max_departures: 8
     show_delay: true
