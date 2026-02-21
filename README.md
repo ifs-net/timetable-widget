@@ -1,6 +1,6 @@
 ﻿# timetable-widget
 
-Container-Projekt für ein konfigurierbares Abfahrts-Widget (HTML) plus JSON-Endpoint für Integration in Drittsysteme.
+Container-Projekt für ein konfigurierbares Abfahrts-Widget (HTML) plus JSON-Endpoint für Integration in Drittsysteme. Ursprünglich war es für die Integration in ein openHAB Smart-Home-System gedacht, siehe hierzu auch https://www.forwardme.de/2026/02/20/openhab-oepnv-timetable-widget-per-docker-container-integriert/
 
 ## Setup
 
@@ -19,6 +19,8 @@ DB_API_KEY=<dein_api_key>
 `config.yaml` anpassen, insbesondere `widgets`.
 Standard in diesem Projekt: Die Konfiguration wird aus `/app/config.example.yaml` im Image geladen.
 Wenn `config.example.yaml` lokal geändert wird, danach neu bauen/starten (`docker compose up -d --build`).
+Hinweis: Beim ersten Start nach einem Build kann die App länger in `Waiting for application startup` stehen,
+da der statische GTFS-Fallback-Index aufgebaut wird.
 
 Hinweis zu Windows/Docker Desktop:
 - In manchen Setups (insbesondere bei Netzlaufwerken) wird ein Datei-Bind-Mount als Verzeichnis interpretiert.
@@ -31,22 +33,26 @@ docker compose up -d --build
 
 ## URLs
 
-- `http://localhost:8000/widget` (Übersicht aller Widgets inkl. Widget-URL, JSON-URL und Stop-IDs)
-- `http://localhost:8000/widget/1` (konkretes Widget nach ID)
-- `http://localhost:8000/json/1` (JSON für konkretes Widget nach ID)
-- `http://localhost:8000/health`
+- `http://<Docker-Container-IP>:8000/widget` (Übersicht aller Widgets inkl. Widget-URL, JSON-URL und Stop-IDs)
+- `http://<Docker-Container-IP>:8000/widget/1` (konkretes Widget nach ID)
+- `http://<Docker-Container-IP>:8000/json/1` (JSON für konkretes Widget nach ID)
+- `http://<Docker-Container-IP>:8000/health`
 
 ## Widget-Konfiguration
 
 Mehrere Widgets werden in `widgets` konfiguriert. Jedes Widget hat eine eigene `id`, einen frei wählbaren `title`
 und eine Datenquelle (`source`).
 
+- Es wird nur noch das Mehrfach-Widget-Format `widgets:` unterstützt.
+- Das frühere Single-Format mit `widget:` und `filter:` ist entfernt.
+- JSON wird pro Widget über `/json/<id>` aufgerufen (z. B. `/json/1`).
+
 ```yaml
 widgets:
   - id: "1"
     title: "Dechbetten/TELIS FINANZ"
     source: "gtfs_rt"
-    stop_ids: ["122010", "36191"]
+    stop_ids: ["27741", "647898"]
     gtfs_lookahead_hours: 24
     max_departures: 8
     show_delay: true
@@ -87,6 +93,11 @@ GTFS-Widget (`source: "gtfs_rt"`):
 - `route_short_names` (optional): zusätzlicher Linienfilter, z. B. `["4","10"]`.
 - `gtfs_lookahead_hours` (Standard: `24`, Bereich `1..48`): Zeitfenster für zukünftige Abfahrten.
 
+- Wenn Echtzeit weniger als `max_departures` liefert, ergänzt die App weitere Abfahrten aus statischen GTFS-Fahrplänen (ohne Live-Verspätung).
+- Echtzeitdaten haben Priorität; statische Fahrten werden nur ergänzend bis `max_departures` genutzt.
+- Für statische Ergänzungen bleibt `delay_s` leer (`null`), weil dafür keine Live-Verspätung vorliegt.
+- Die Fahrtrichtung im Fallback kommt aus `trip_headsign` aus den GTFS-Static-Daten.
+
 DB-Widget (`source: "db_iris"`):
 
 - `db_eva_no` (Pflicht): EVA-Nummer des Bahnhofs, z. B. `"8004983"`.
@@ -97,6 +108,8 @@ DB-Widget (`source: "db_iris"`):
 Hinweise zur Wirkung:
 
 - `stop_ids` wird nur bei `gtfs_rt` ausgewertet.
+- Die Meldung `Falsche Konfiguration: Stop-ID ... nicht gefunden.` basiert auf `stops.txt` aus den statischen GTFS-Daten, nicht auf einem einzelnen Live-Snapshot.
+- Wenn eine Stop-ID im Live-Feed temporär keine Fahrten hat, wird sie dadurch nicht mehr fälschlich als Konfigurationsfehler markiert.
 - `db_eva_no`, `db_only_trains`, `db_use_fchg`, `db_lookahead_hours` werden nur bei `db_iris` ausgewertet.
 - `source` akzeptiert intern auch Aliase (`gtfs`, `gtfs-realtime`, `db`, `db_timetables`), empfohlen sind aber `gtfs_rt` bzw. `db_iris`.
 - Falls ein GTFS-Widget `route_short_names` setzt, aber kein Mapping verfügbar ist, erscheinen dazu klare Fehlhinweise im Widget.
@@ -124,6 +137,13 @@ config:
 ```
 
 ## Hinweise
+
+## GTFS-RT Und Statischer Fallback
+
+- Für `source: "gtfs_rt"` wird zuerst ausschließlich aus dem Echtzeit-Feed gelesen.
+- Falls weniger Treffer als `max_departures` vorhanden sind, wird mit statischen GTFS-Fahrplänen bis zum Limit ergänzt.
+- Deduplizierung erfolgt über `trip_id + time_epoch + stop_id`, damit Einträge nicht doppelt erscheinen.
+- Der Fallback gilt nur für GTFS-Widgets; DB-Widgets (`source: "db_iris"`) sind davon unberührt.
 
 - Optional für schnelleres GTFS-Mapping: `GTFS_STATIC_CACHE_PATH` (Standard: `/tmp/nv_free_latest.zip`) und `GTFS_STATIC_CACHE_MAX_AGE_SECONDS` (Standard: `43200`).
 - GTFS-Realtime ist Protobuf; DB Timetables API liefert XML. Der Container bereitet beides für HTML/JSON auf.
@@ -266,17 +286,25 @@ Bitte bezüglich des eigenen Einsatzes selbst jeweils die rechtlichen Rahmenbedi
 
 ## Debug-Modus
 
-- Debug aktivieren: `DEBUG_MODE=1`
-- Logpfad: `DEBUG_LOG_PATH=/logs/logfile.txt`
+- Startwert per Umgebung: `DEBUG_MODE=1` (oder `0`).
+- Standard-Logpfad: `DEBUG_LOG_PATH=/logs/logfile.txt`.
 - Bei Compose ist `./logs:/logs` gemountet, Logdatei lokal unter `logs/logfile.txt`.
-- Die Debug-Logs enthalten Stage-Timings für Analyse: `mapping_csv:*`, `mapping_static:*`, `mapping_enrich:*`, `poll_once:*`, `db_iris:*`.
+- Laufzeit-Umschaltung ohne Container-Neustart:
+- `GET /debug` zeigt aktuellen Zustand.
+- `POST /debug/on` aktiviert Debug-Logging.
+- `POST /debug/on?log_path=/logs/mein-debug.log` aktiviert Debug mit anderem Logpfad.
+- `POST /debug/off` deaktiviert Debug-Logging.
+- Die Debug-Logs enthalten Stage-Timings für Analyse: `mapping_csv:*`, `mapping_static:*`, `mapping_enrich:*`, `poll_once:*`, `db_iris:*`, `fallback_static:*`.
+- Hinweis: Die Debug-Endpunkte sind aktuell nicht authentifiziert und sollten nur in vertrauenswürdigen Netzen erreichbar sein.
 
 ## Warmup beim Start
 
 - `WARMUP_STATIC_CACHE_ON_START=1` (Standard in Compose): lädt beim Start den GTFS-Static-Cache (`/tmp/nv_free_latest.zip`) vor.
+- Zusätzlich wird beim Start der statische Fallback-Index für konfigurierte GTFS-Stop-IDs aufgebaut.
 - Vorteil: Der erste Widget-Aufruf muss den großen Static-Download nicht mehr selbst auslösen.
 - `WARMUP_ON_START=1` (optional): führt zusätzlich einen kompletten Daten-Warmup aus.
 - Hinweis: Warmup verlagert Wartezeit auf den Container-Start und kann den Start verlangsamen.
+
 
 
 
