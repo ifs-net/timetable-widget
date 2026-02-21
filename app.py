@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import csv
 import html
 import io
@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -57,6 +58,34 @@ def to_local_datetime(epoch_seconds: int) -> datetime:
     return datetime.fromtimestamp(epoch_seconds, tz=LOCAL_TIMEZONE)
 
 
+def detect_instance_ip() -> str:
+    configured_ip = os.getenv("LOG_INSTANCE_IP", "").strip()
+    if configured_ip:
+        return configured_ip
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            detected = str(probe.getsockname()[0]).strip()
+            if detected:
+                return detected
+    except Exception:
+        pass
+
+    try:
+        detected = str(socket.gethostbyname(socket.gethostname())).strip()
+        if detected:
+            return detected
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+INSTANCE_HOSTNAME = socket.gethostname()
+INSTANCE_IP = detect_instance_ip()
+
+
 DEBUG_LOGGER_LOCK = threading.Lock()
 DEBUG_ENABLED = False
 DEBUG_LOGGER: Optional[logging.Logger] = None
@@ -99,7 +128,11 @@ def configure_debug_logger(enabled: bool, log_path: Optional[str] = None) -> tup
             resolved_path.parent.mkdir(parents=True, exist_ok=True)
             _close_logger_handlers(logger)
             handler = logging.FileHandler(resolved_path, encoding="utf-8")
-            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            handler.setFormatter(
+                logging.Formatter(
+                    f"%(asctime)s %(levelname)s [host={INSTANCE_HOSTNAME} ip={INSTANCE_IP}] %(message)s"
+                )
+            )
             logger.addHandler(handler)
             logger.info("Debug mode enabled. Log path: %s", resolved_path)
             DEBUG_LOGGER = logger
@@ -118,6 +151,8 @@ def get_debug_status() -> dict:
             "enabled": DEBUG_ENABLED,
             "log_path": DEBUG_LOG_PATH,
             "active_logger": DEBUG_LOGGER is not None,
+            "instance_host": INSTANCE_HOSTNAME,
+            "instance_ip": INSTANCE_IP,
         }
 
 
@@ -555,7 +590,7 @@ def load_trip_route_map_from_static_gtfs(
 
             if not trip_ids:
                 debug_log("mapping_fallback:no_trips_for_configured_stop_ids")
-                return {}, {}, "mapping fallback: keine Trips für konfigurierte stop_ids gefunden"
+                return {}, {}, "mapping fallback: keine Trips fÃ¼r konfigurierte stop_ids gefunden"
 
             trips_started = time.monotonic()
             trip_to_route_id: dict[str, str] = {}
@@ -1185,24 +1220,44 @@ def load_static_fallback_index_for_stop_ids(
         with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
             stop_entries: dict[str, list[tuple[str, int]]] = {stop_id: [] for stop_id in target_stop_ids}
             relevant_trip_ids: set[str] = set()
+            trip_last_stop_seq: dict[str, int] = {}
+            trip_last_stop_id: dict[str, str] = {}
 
             stop_times_started = time.monotonic()
             with archive.open("stop_times.txt", "r") as handle:
                 reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
                 for row in reader:
-                    stop_id = str(row.get("stop_id", "")).strip()
-                    if stop_id not in target_stop_ids:
-                        continue
                     trip_id = str(row.get("trip_id", "")).strip()
                     if not trip_id:
                         continue
-                    departure_seconds = _parse_gtfs_hms_to_seconds(
-                        str(row.get("departure_time", "")).strip() or str(row.get("arrival_time", "")).strip()
-                    )
-                    if departure_seconds is None:
-                        continue
-                    stop_entries.setdefault(stop_id, []).append((trip_id, departure_seconds))
-                    relevant_trip_ids.add(trip_id)
+
+                    stop_id = str(row.get("stop_id", "")).strip()
+                    if stop_id in target_stop_ids:
+                        departure_seconds = _parse_gtfs_hms_to_seconds(
+                            str(row.get("departure_time", "")).strip() or str(row.get("arrival_time", "")).strip()
+                        )
+                        if departure_seconds is not None:
+                            stop_entries.setdefault(stop_id, []).append((trip_id, departure_seconds))
+                            relevant_trip_ids.add(trip_id)
+
+                    # GTFS stop_times ist ueblicherweise nach trip_id/stop_sequence sortiert.
+                    # Sobald ein relevanter Trip bekannt ist, merken wir uns den letzten Halt als Richtungs-Fallback.
+                    if trip_id in relevant_trip_ids and stop_id:
+                        sequence_raw = str(row.get("stop_sequence", "")).strip()
+                        sequence: Optional[int] = None
+                        if sequence_raw:
+                            try:
+                                sequence = int(sequence_raw)
+                            except ValueError:
+                                sequence = None
+
+                        if sequence is None:
+                            trip_last_stop_id[trip_id] = stop_id
+                        else:
+                            current = trip_last_stop_seq.get(trip_id)
+                            if current is None or sequence >= current:
+                                trip_last_stop_seq[trip_id] = sequence
+                                trip_last_stop_id[trip_id] = stop_id
             stop_times_elapsed = time.monotonic() - stop_times_started
 
             if not relevant_trip_ids:
@@ -1235,6 +1290,36 @@ def load_static_fallback_index_for_stop_ids(
                     if headsign:
                         trip_direction[trip_id] = headsign
             trips_elapsed = time.monotonic() - trips_started
+
+            missing_direction_trip_ids = [trip_id for trip_id in relevant_trip_ids if not trip_direction.get(trip_id)]
+            terminal_stop_ids = {
+                trip_last_stop_id.get(trip_id, "") for trip_id in missing_direction_trip_ids if trip_last_stop_id.get(trip_id, "")
+            }
+            terminal_stop_names: dict[str, str] = {}
+            stops_lookup_elapsed = 0.0
+            derived_directions = 0
+            if terminal_stop_ids:
+                stops_lookup_started = time.monotonic()
+                try:
+                    with archive.open("stops.txt", "r") as handle:
+                        reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
+                        for row in reader:
+                            stop_id = str(row.get("stop_id", "")).strip()
+                            if stop_id not in terminal_stop_ids:
+                                continue
+                            stop_name = str(row.get("stop_name", "")).strip()
+                            if stop_name:
+                                terminal_stop_names[stop_id] = stop_name
+                except KeyError:
+                    pass
+                stops_lookup_elapsed = time.monotonic() - stops_lookup_started
+
+                for trip_id in missing_direction_trip_ids:
+                    terminal_stop_id = trip_last_stop_id.get(trip_id, "")
+                    direction_name = terminal_stop_names.get(terminal_stop_id, "").strip()
+                    if direction_name:
+                        trip_direction[trip_id] = direction_name
+                        derived_directions += 1
 
             route_id_to_short: dict[str, str] = {}
             routes_started = time.monotonic()
@@ -1328,9 +1413,10 @@ def load_static_fallback_index_for_stop_ids(
                 "fallback_static:index_ready "
                 f"stop_ids={len(target_stop_ids)} entries={total_entries} trips={len(relevant_trip_ids)} "
                 f"with_routes={len(trip_route)} with_service={len(trip_service)} "
+                f"with_direction={len(trip_direction)} direction_from_terminal={derived_directions} "
                 f"stop_times_s={stop_times_elapsed:.2f} trips_s={trips_elapsed:.2f} routes_s={routes_elapsed:.2f} "
-                f"calendar_s={calendar_elapsed:.2f} calendar_dates_s={calendar_dates_elapsed:.2f} "
-                f"total_s={time.monotonic() - started_at:.2f}"
+                f"stops_lookup_s={stops_lookup_elapsed:.2f} calendar_s={calendar_elapsed:.2f} "
+                f"calendar_dates_s={calendar_dates_elapsed:.2f} total_s={time.monotonic() - started_at:.2f}"
             )
             return index, None
     except Exception as exc:
@@ -1750,13 +1836,13 @@ async def poll_once(state: RuntimeState) -> None:
                 if mapping_error:
                     widget_errors.append(mapping_error)
                 if not widget.stop_ids:
-                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer möglich.")
+                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer mÃ¶glich.")
                 if widget.route_short_names and not route_map:
                     widget_errors.append(
-                        f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfügbar."
+                        f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfÃ¼gbar."
                     )
                 if not known_stop_ids and known_stop_ids_error:
-                    widget_errors.append(f"Stop-ID-Validierung aktuell nicht verfügbar: {known_stop_ids_error}")
+                    widget_errors.append(f"Stop-ID-Validierung aktuell nicht verfÃ¼gbar: {known_stop_ids_error}")
                 for stop_id in widget.stop_ids:
                     if known_stop_ids and stop_id not in known_stop_ids:
                         widget_errors.append(f"Falsche Konfiguration: Stop-ID {stop_id} nicht gefunden.")
@@ -1785,7 +1871,7 @@ async def poll_once(state: RuntimeState) -> None:
                             f"merged={len(departures)}"
                         )
                     elif static_fallback_error and realtime_count == 0:
-                        widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfügbar: {static_fallback_error}")
+                        widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfÃ¼gbar: {static_fallback_error}")
 
                 departures_by_widget[widget.id] = departures
                 total_departures += len(departures)
@@ -2033,7 +2119,7 @@ def render_widget_html(
         error_text = " | ".join(html.escape(error) for error in errors)
         rows.append(f"<tr><td colspan='5'>{error_text}</td></tr>")
     elif not rows:
-        rows.append("<tr><td colspan='5'>Keine Abfahrten verfügbar.</td></tr>")
+        rows.append("<tr><td colspan='5'>Keine Abfahrten verfÃ¼gbar.</td></tr>")
 
     rows_html = "".join(rows)
     meta_block = ""
@@ -2241,7 +2327,7 @@ def render_widget_html(
         return;
       }}
 
-      body.innerHTML = "<tr><td colspan='5'>Keine Abfahrten verfügbar.</td></tr>";
+      body.innerHTML = "<tr><td colspan='5'>Keine Abfahrten verfÃ¼gbar.</td></tr>";
     }}
 
     function renderMeta() {{
@@ -2325,7 +2411,7 @@ def render_widget_index_html(config: AppConfig, base_url: str) -> str:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Widget-Übersicht</title>
+  <title>Widget-Ãœbersicht</title>
   <style>
     body {{ font-family: "Segoe UI", Tahoma, sans-serif; margin: 16px; background: #f5f7fb; color: #1f2937; }}
     table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d1d5db; border-radius: 8px; overflow: hidden; }}
@@ -2335,7 +2421,7 @@ def render_widget_index_html(config: AppConfig, base_url: str) -> str:
   </style>
 </head>
 <body>
-  <h2>Verfügbare Widgets</h2>
+  <h2>VerfÃ¼gbare Widgets</h2>
   <p>Direkter Aufruf je Widget-ID: <code>/widget/&lt;id&gt;</code></p>
   <table>
     <thead>
@@ -2492,23 +2578,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
