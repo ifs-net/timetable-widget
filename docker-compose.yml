@@ -1,14 +1,14 @@
-﻿services:
+services:
   timetable-widget:
     build: .
     container_name: timetable-widget
     restart: unless-stopped
     volumes:
-      - ./data:/data
-      - ./logs:/logs
+      - /volume1/docker/timetable-widget-mount/data:/data
+      - /volume1/docker/timetable-widget-mount/logs:/logs
     environment:
       - CONFIG_PATH=${CONFIG_PATH:-/app/config.example.yaml}
-      - FALLBACK_CONFIG_PATH=${FALLBACK_CONFIG_PATH:-/app/config.example.yaml}
+      - FALLBACK_CONFIG_PATH=/volume1/docker/timetable-widget-mount/config.yaml}
       - DEBUG_MODE=${DEBUG_MODE:-0}
       - DEBUG_LOG_PATH=${DEBUG_LOG_PATH:-/logs/logfile.txt}
       - WARMUP_ON_START=${WARMUP_ON_START:-0}
