@@ -6,12 +6,13 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -56,30 +57,77 @@ def to_local_datetime(epoch_seconds: int) -> datetime:
     return datetime.fromtimestamp(epoch_seconds, tz=LOCAL_TIMEZONE)
 
 
-def setup_debug_logger() -> Optional[logging.Logger]:
-    if not DEBUG_MODE:
-        return None
-    try:
-        log_path = Path(DEBUG_LOG_PATH)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+DEBUG_LOGGER_LOCK = threading.Lock()
+DEBUG_ENABLED = False
+DEBUG_LOGGER: Optional[logging.Logger] = None
+
+
+def _close_logger_handlers(logger: logging.Logger) -> None:
+    for handler in list(logger.handlers):
+        logger.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+
+def configure_debug_logger(enabled: bool, log_path: Optional[str] = None) -> tuple[bool, str]:
+    global DEBUG_ENABLED
+    global DEBUG_LOGGER
+    global DEBUG_LOG_PATH
+
+    with DEBUG_LOGGER_LOCK:
+        if log_path is not None:
+            candidate = str(log_path).strip()
+            if candidate:
+                DEBUG_LOG_PATH = candidate
+        if not DEBUG_LOG_PATH:
+            DEBUG_LOG_PATH = "/logs/logfile.txt"
+
         logger = logging.getLogger("timetable_widget_debug")
         logger.setLevel(logging.INFO)
-        logger.handlers.clear()
-        handler = logging.FileHandler(log_path, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-        logger.addHandler(handler)
         logger.propagate = False
-        logger.info("Debug mode enabled. Log path: %s", log_path)
-        return logger
-    except Exception:
-        return None
+
+        if not enabled:
+            _close_logger_handlers(logger)
+            DEBUG_LOGGER = None
+            DEBUG_ENABLED = False
+            return False, "Debug-Modus deaktiviert."
+
+        try:
+            resolved_path = Path(DEBUG_LOG_PATH)
+            resolved_path.parent.mkdir(parents=True, exist_ok=True)
+            _close_logger_handlers(logger)
+            handler = logging.FileHandler(resolved_path, encoding="utf-8")
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(handler)
+            logger.info("Debug mode enabled. Log path: %s", resolved_path)
+            DEBUG_LOGGER = logger
+            DEBUG_ENABLED = True
+            return True, f"Debug-Modus aktiviert. Log-Datei: {resolved_path}"
+        except Exception as exc:
+            _close_logger_handlers(logger)
+            DEBUG_LOGGER = None
+            DEBUG_ENABLED = False
+            return False, f"Debug-Modus konnte nicht aktiviert werden: {exc}"
 
 
-DEBUG_LOGGER = setup_debug_logger()
+def get_debug_status() -> dict:
+    with DEBUG_LOGGER_LOCK:
+        return {
+            "enabled": DEBUG_ENABLED,
+            "log_path": DEBUG_LOG_PATH,
+            "active_logger": DEBUG_LOGGER is not None,
+        }
+
+
+configure_debug_logger(DEBUG_MODE, DEBUG_LOG_PATH)
+
 
 def debug_log(message: str) -> None:
-    if DEBUG_LOGGER:
-        DEBUG_LOGGER.info(message)
+    logger = DEBUG_LOGGER
+    if logger:
+        logger.info(message)
 
 
 def build_db_timetables_headers() -> dict[str, str]:
@@ -167,6 +215,17 @@ class Departure:
 
 
 @dataclass
+class StaticFallbackIndex:
+    stop_entries: dict[str, list[tuple[str, int]]]
+    trip_route: dict[str, str]
+    trip_direction: dict[str, str]
+    trip_service: dict[str, str]
+    service_weekdays: dict[str, tuple[int, int, int, int, int, int, int]]
+    service_date_range: dict[str, tuple[date, date]]
+    service_exceptions: dict[str, dict[date, int]]
+
+
+@dataclass
 class RuntimeState:
     config: AppConfig
     departures_by_widget: dict[str, list[Departure]] = field(default_factory=dict)
@@ -177,6 +236,12 @@ class RuntimeState:
     mapping_error: Optional[str] = None
     next_mapping_reload_monotonic: float = 0.0
     next_refresh_due_monotonic: float = 0.0
+    known_stop_ids: set[str] = field(default_factory=set)
+    known_stop_ids_error: Optional[str] = None
+    next_known_stop_ids_reload_monotonic: float = 0.0
+    static_fallback_index: Optional[StaticFallbackIndex] = None
+    static_fallback_error: Optional[str] = None
+    next_static_fallback_reload_monotonic: float = 0.0
     refresh_task: Optional[asyncio.Task] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -295,80 +360,56 @@ def parse_config(data: dict) -> AppConfig:
             feed_data.get("http_timeout_seconds"), 15, "feed.http_timeout_seconds", min_value=1
         ),
     )
-    widgets: list[WidgetConfig] = []
     widgets_data = data.get("widgets")
-    if widgets_data is not None:
-        if not isinstance(widgets_data, list):
-            raise ValueError("widgets must be a list")
-        for idx, widget_data in enumerate(widgets_data):
-            if not isinstance(widget_data, dict):
-                raise ValueError(f"widgets[{idx}] must be a mapping")
-            route_short_names: Optional[list[str]] = None
-            if "route_short_names" in widget_data and widget_data.get("route_short_names") is not None:
-                route_short_names = _to_str_list(
-                    widget_data.get("route_short_names"), f"widgets[{idx}].route_short_names"
-                )
-            direction_contains: Optional[list[str]] = None
-            if "direction_contains" in widget_data and widget_data.get("direction_contains") is not None:
-                direction_contains = _to_str_list(
-                    widget_data.get("direction_contains"), f"widgets[{idx}].direction_contains"
-                )
-            required_stops: Optional[list[str]] = None
-            if "required_stops" in widget_data and widget_data.get("required_stops") is not None:
-                required_stops = _to_str_list(
-                    widget_data.get("required_stops"), f"widgets[{idx}].required_stops"
-                )
-            widgets.append(
-                WidgetConfig(
-                    id=_to_non_empty_str(widget_data.get("id"), str(idx + 1), f"widgets[{idx}].id"),
-                    title=_to_non_empty_str(widget_data.get("title"), f"Widget {idx + 1}", f"widgets[{idx}].title"),
-                    stop_ids=_to_str_list(widget_data.get("stop_ids", []), f"widgets[{idx}].stop_ids"),
-                    route_short_names=route_short_names,
-                    source=_normalize_widget_source(widget_data.get("source", "gtfs_rt"), f"widgets[{idx}].source"),
-                    db_eva_no=_to_str(widget_data.get("db_eva_no"), "") or None,
-                    direction_contains=direction_contains,
-                    required_stops=required_stops,
-                    db_lookahead_hours=_to_int(
-                        widget_data.get("db_lookahead_hours"), 24, f"widgets[{idx}].db_lookahead_hours", min_value=1, max_value=24
-                    ),
-                    db_only_trains=_to_bool(widget_data.get("db_only_trains"), False),
-                    db_use_fchg=_to_bool(widget_data.get("db_use_fchg"), True),
-                    gtfs_lookahead_hours=_to_int(
-                        widget_data.get("gtfs_lookahead_hours"),
-                        24,
-                        f"widgets[{idx}].gtfs_lookahead_hours",
-                        min_value=1,
-                        max_value=48,
-                    ),
-                    max_departures=_to_int(
-                        widget_data.get("max_departures"), 8, f"widgets[{idx}].max_departures", min_value=1
-                    ),
-                    show_delay=_to_bool(widget_data.get("show_delay"), True),
-                    show_feed_age=_to_bool(widget_data.get("show_feed_age"), True),
-                )
-            )
-    else:
-        # Backward compatibility for old single-widget config layout.
-        widget_data = _get_section(data, "widget")
-        filter_data = _get_section(data, "filter")
+    if widgets_data is None:
+        raise ValueError("widgets section is required; old single-widget config format is no longer supported")
+    if not isinstance(widgets_data, list):
+        raise ValueError("widgets must be a list")
+
+    widgets: list[WidgetConfig] = []
+    for idx, widget_data in enumerate(widgets_data):
+        if not isinstance(widget_data, dict):
+            raise ValueError(f"widgets[{idx}] must be a mapping")
         route_short_names: Optional[list[str]] = None
-        if "route_short_names" in filter_data and filter_data.get("route_short_names") is not None:
-            route_short_names = _to_str_list(filter_data.get("route_short_names"), "filter.route_short_names")
+        if "route_short_names" in widget_data and widget_data.get("route_short_names") is not None:
+            route_short_names = _to_str_list(
+                widget_data.get("route_short_names"), f"widgets[{idx}].route_short_names"
+            )
+        direction_contains: Optional[list[str]] = None
+        if "direction_contains" in widget_data and widget_data.get("direction_contains") is not None:
+            direction_contains = _to_str_list(
+                widget_data.get("direction_contains"), f"widgets[{idx}].direction_contains"
+            )
+        required_stops: Optional[list[str]] = None
+        if "required_stops" in widget_data and widget_data.get("required_stops") is not None:
+            required_stops = _to_str_list(
+                widget_data.get("required_stops"), f"widgets[{idx}].required_stops"
+            )
         widgets.append(
             WidgetConfig(
-                id="1",
-                title=_to_non_empty_str(widget_data.get("title"), "Timetable Widget", "widget.title"),
-                stop_ids=_to_str_list(filter_data.get("stop_ids", []), "filter.stop_ids"),
+                id=_to_non_empty_str(widget_data.get("id"), str(idx + 1), f"widgets[{idx}].id"),
+                title=_to_non_empty_str(widget_data.get("title"), f"Widget {idx + 1}", f"widgets[{idx}].title"),
+                stop_ids=_to_str_list(widget_data.get("stop_ids", []), f"widgets[{idx}].stop_ids"),
                 route_short_names=route_short_names,
-                source="gtfs_rt",
-                db_eva_no=None,
-                direction_contains=None,
-                required_stops=None,
-                db_lookahead_hours=24,
-                db_only_trains=False,
-                db_use_fchg=True,
-                gtfs_lookahead_hours=24,
-                max_departures=_to_int(widget_data.get("max_departures"), 8, "widget.max_departures", min_value=1),
+                source=_normalize_widget_source(widget_data.get("source", "gtfs_rt"), f"widgets[{idx}].source"),
+                db_eva_no=_to_str(widget_data.get("db_eva_no"), "") or None,
+                direction_contains=direction_contains,
+                required_stops=required_stops,
+                db_lookahead_hours=_to_int(
+                    widget_data.get("db_lookahead_hours"), 24, f"widgets[{idx}].db_lookahead_hours", min_value=1, max_value=24
+                ),
+                db_only_trains=_to_bool(widget_data.get("db_only_trains"), False),
+                db_use_fchg=_to_bool(widget_data.get("db_use_fchg"), True),
+                gtfs_lookahead_hours=_to_int(
+                    widget_data.get("gtfs_lookahead_hours"),
+                    24,
+                    f"widgets[{idx}].gtfs_lookahead_hours",
+                    min_value=1,
+                    max_value=48,
+                ),
+                max_departures=_to_int(
+                    widget_data.get("max_departures"), 8, f"widgets[{idx}].max_departures", min_value=1
+                ),
                 show_delay=_to_bool(widget_data.get("show_delay"), True),
                 show_feed_age=_to_bool(widget_data.get("show_feed_age"), True),
             )
@@ -1026,22 +1067,6 @@ def extract_departures(
     return departures[: widget.max_departures]
 
 
-def find_missing_stop_ids(feed_message: gtfs_realtime_pb2.FeedMessage, configured_stop_ids: list[str]) -> list[str]:
-    configured = {str(stop_id).strip() for stop_id in configured_stop_ids if str(stop_id).strip()}
-    if not configured:
-        return []
-
-    seen: set[str] = set()
-    for entity in feed_message.entity:
-        if not entity.HasField("trip_update"):
-            continue
-        for stop_update in entity.trip_update.stop_time_update:
-            stop_id = str(stop_update.stop_id or "").strip()
-            if stop_id:
-                seen.add(stop_id)
-
-    return sorted(configured - seen)
-
 
 def load_static_gtfs_archive_bytes(timeout_seconds: int) -> tuple[Optional[bytes], Optional[str]]:
     cache_path = Path(GTFS_STATIC_CACHE_PATH)
@@ -1090,6 +1115,348 @@ def load_static_gtfs_archive_bytes(timeout_seconds: int) -> tuple[Optional[bytes
             except Exception as cache_exc:
                 debug_log(f"mapping_static:stale_cache_read_failed path={cache_path} error={cache_exc}")
         return None, f"mapping static download failed: {exc}"
+
+
+def load_known_stop_ids_from_static_gtfs(timeout_seconds: int) -> tuple[set[str], Optional[str]]:
+    started_at = time.monotonic()
+    payload, load_error = load_static_gtfs_archive_bytes(timeout_seconds)
+    if payload is None:
+        return set(), load_error or "stops index payload unavailable"
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+            stop_ids: set[str] = set()
+            with archive.open("stops.txt", "r") as handle:
+                reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
+                for row in reader:
+                    stop_id = str(row.get("stop_id", "")).strip()
+                    if stop_id:
+                        stop_ids.add(stop_id)
+        debug_log(
+            "mapping_static:stops_indexed "
+            f"count={len(stop_ids)} duration_s={time.monotonic() - started_at:.2f}"
+        )
+        return stop_ids, None
+    except Exception as exc:
+        debug_log(f"mapping_static:stops_index_failed error={exc}")
+        return set(), f"stops index parse failed: {exc}"
+
+
+def _parse_gtfs_hms_to_seconds(raw_value: str) -> Optional[int]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = int(parts[2])
+    except (TypeError, ValueError):
+        return None
+    if hours < 0 or minutes < 0 or minutes > 59 or seconds < 0 or seconds > 59:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def load_static_fallback_index_for_stop_ids(
+    stop_ids: list[str], timeout_seconds: int
+) -> tuple[Optional[StaticFallbackIndex], Optional[str]]:
+    started_at = time.monotonic()
+    target_stop_ids = {stop_id.strip() for stop_id in stop_ids if stop_id.strip()}
+    empty_index = StaticFallbackIndex(
+        stop_entries={},
+        trip_route={},
+        trip_direction={},
+        trip_service={},
+        service_weekdays={},
+        service_date_range={},
+        service_exceptions={},
+    )
+    if not target_stop_ids:
+        return empty_index, None
+
+    payload, load_error = load_static_gtfs_archive_bytes(timeout_seconds)
+    if payload is None:
+        return None, load_error or "static fallback payload unavailable"
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+            stop_entries: dict[str, list[tuple[str, int]]] = {stop_id: [] for stop_id in target_stop_ids}
+            relevant_trip_ids: set[str] = set()
+
+            stop_times_started = time.monotonic()
+            with archive.open("stop_times.txt", "r") as handle:
+                reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
+                for row in reader:
+                    stop_id = str(row.get("stop_id", "")).strip()
+                    if stop_id not in target_stop_ids:
+                        continue
+                    trip_id = str(row.get("trip_id", "")).strip()
+                    if not trip_id:
+                        continue
+                    departure_seconds = _parse_gtfs_hms_to_seconds(
+                        str(row.get("departure_time", "")).strip() or str(row.get("arrival_time", "")).strip()
+                    )
+                    if departure_seconds is None:
+                        continue
+                    stop_entries.setdefault(stop_id, []).append((trip_id, departure_seconds))
+                    relevant_trip_ids.add(trip_id)
+            stop_times_elapsed = time.monotonic() - stop_times_started
+
+            if not relevant_trip_ids:
+                debug_log(
+                    "fallback_static:no_relevant_trips "
+                    f"stop_ids={len(target_stop_ids)} stop_times_s={stop_times_elapsed:.2f}"
+                )
+                return empty_index, None
+
+            trip_route_id: dict[str, str] = {}
+            trip_direction: dict[str, str] = {}
+            trip_service: dict[str, str] = {}
+            needed_route_ids: set[str] = set()
+
+            trips_started = time.monotonic()
+            with archive.open("trips.txt", "r") as handle:
+                reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
+                for row in reader:
+                    trip_id = str(row.get("trip_id", "")).strip()
+                    if trip_id not in relevant_trip_ids:
+                        continue
+                    route_id = str(row.get("route_id", "")).strip()
+                    service_id = str(row.get("service_id", "")).strip()
+                    headsign = str(row.get("trip_headsign", "")).strip()
+                    if route_id:
+                        trip_route_id[trip_id] = route_id
+                        needed_route_ids.add(route_id)
+                    if service_id:
+                        trip_service[trip_id] = service_id
+                    if headsign:
+                        trip_direction[trip_id] = headsign
+            trips_elapsed = time.monotonic() - trips_started
+
+            route_id_to_short: dict[str, str] = {}
+            routes_started = time.monotonic()
+            with archive.open("routes.txt", "r") as handle:
+                reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
+                for row in reader:
+                    route_id = str(row.get("route_id", "")).strip()
+                    if route_id not in needed_route_ids:
+                        continue
+                    short_name = str(row.get("route_short_name", "")).strip()
+                    if short_name:
+                        route_id_to_short[route_id] = short_name
+            routes_elapsed = time.monotonic() - routes_started
+
+            trip_route: dict[str, str] = {}
+            for trip_id, route_id in trip_route_id.items():
+                short_name = route_id_to_short.get(route_id, "").strip()
+                if short_name:
+                    trip_route[trip_id] = short_name
+
+            needed_service_ids = {service_id for service_id in trip_service.values() if service_id}
+            service_weekdays: dict[str, tuple[int, int, int, int, int, int, int]] = {}
+            service_date_range: dict[str, tuple[date, date]] = {}
+            service_exceptions: dict[str, dict[date, int]] = {}
+
+            calendar_started = time.monotonic()
+            try:
+                with archive.open("calendar.txt", "r") as handle:
+                    reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
+                    for row in reader:
+                        service_id = str(row.get("service_id", "")).strip()
+                        if service_id not in needed_service_ids:
+                            continue
+                        start_raw = str(row.get("start_date", "")).strip()
+                        end_raw = str(row.get("end_date", "")).strip()
+                        try:
+                            start_date = datetime.strptime(start_raw, "%Y%m%d").date()
+                            end_date = datetime.strptime(end_raw, "%Y%m%d").date()
+                        except ValueError:
+                            continue
+                        weekday_flags = (
+                            int(str(row.get("monday", "0")).strip() or "0"),
+                            int(str(row.get("tuesday", "0")).strip() or "0"),
+                            int(str(row.get("wednesday", "0")).strip() or "0"),
+                            int(str(row.get("thursday", "0")).strip() or "0"),
+                            int(str(row.get("friday", "0")).strip() or "0"),
+                            int(str(row.get("saturday", "0")).strip() or "0"),
+                            int(str(row.get("sunday", "0")).strip() or "0"),
+                        )
+                        service_weekdays[service_id] = weekday_flags
+                        service_date_range[service_id] = (start_date, end_date)
+            except KeyError:
+                pass
+            calendar_elapsed = time.monotonic() - calendar_started
+
+            calendar_dates_started = time.monotonic()
+            try:
+                with archive.open("calendar_dates.txt", "r") as handle:
+                    reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
+                    for row in reader:
+                        service_id = str(row.get("service_id", "")).strip()
+                        if service_id not in needed_service_ids:
+                            continue
+                        date_raw = str(row.get("date", "")).strip()
+                        exception_raw = str(row.get("exception_type", "")).strip()
+                        try:
+                            service_date = datetime.strptime(date_raw, "%Y%m%d").date()
+                            exception_type = int(exception_raw)
+                        except (TypeError, ValueError):
+                            continue
+                        service_exceptions.setdefault(service_id, {})[service_date] = exception_type
+            except KeyError:
+                pass
+            calendar_dates_elapsed = time.monotonic() - calendar_dates_started
+
+            for stop_id in stop_entries:
+                stop_entries[stop_id].sort(key=lambda item: item[1])
+
+            index = StaticFallbackIndex(
+                stop_entries=stop_entries,
+                trip_route=trip_route,
+                trip_direction=trip_direction,
+                trip_service=trip_service,
+                service_weekdays=service_weekdays,
+                service_date_range=service_date_range,
+                service_exceptions=service_exceptions,
+            )
+
+            total_entries = sum(len(items) for items in stop_entries.values())
+            debug_log(
+                "fallback_static:index_ready "
+                f"stop_ids={len(target_stop_ids)} entries={total_entries} trips={len(relevant_trip_ids)} "
+                f"with_routes={len(trip_route)} with_service={len(trip_service)} "
+                f"stop_times_s={stop_times_elapsed:.2f} trips_s={trips_elapsed:.2f} routes_s={routes_elapsed:.2f} "
+                f"calendar_s={calendar_elapsed:.2f} calendar_dates_s={calendar_dates_elapsed:.2f} "
+                f"total_s={time.monotonic() - started_at:.2f}"
+            )
+            return index, None
+    except Exception as exc:
+        debug_log(f"fallback_static:index_failed error={exc}")
+        return None, f"static fallback parse failed: {exc}"
+
+
+def _service_runs_on_date(index: StaticFallbackIndex, service_id: str, service_date: date) -> bool:
+    exceptions = index.service_exceptions.get(service_id)
+    if exceptions and service_date in exceptions:
+        return exceptions[service_date] == 1
+
+    weekday_flags = index.service_weekdays.get(service_id)
+    date_range = index.service_date_range.get(service_id)
+    if weekday_flags is None or date_range is None:
+        return False
+
+    start_date, end_date = date_range
+    if service_date < start_date or service_date > end_date:
+        return False
+
+    weekday = service_date.weekday()
+    if weekday < 0 or weekday > 6:
+        return False
+    return bool(weekday_flags[weekday])
+
+
+def extract_static_schedule_departures(
+    widget: WidgetConfig,
+    index: StaticFallbackIndex,
+    now_epoch: int,
+) -> list[Departure]:
+    stop_ids = [stop_id for stop_id in widget.stop_ids if stop_id]
+    if not stop_ids:
+        return []
+
+    route_filter = set(widget.route_short_names or [])
+    max_time_epoch = now_epoch + max(1, widget.gtfs_lookahead_hours) * 3600
+    now_local = to_local_datetime(now_epoch)
+    max_local = to_local_datetime(max_time_epoch)
+    start_service_date = (now_local - timedelta(days=1)).date()
+    end_service_date = max_local.date()
+
+    departures: list[Departure] = []
+    seen_keys: set[tuple[str, int, str]] = set()
+    service_dates_cache: dict[str, list[date]] = {}
+
+    def service_dates_for(service_id: str) -> list[date]:
+        if service_id in service_dates_cache:
+            return service_dates_cache[service_id]
+        dates: list[date] = []
+        cursor = start_service_date
+        while cursor <= end_service_date:
+            if _service_runs_on_date(index, service_id, cursor):
+                dates.append(cursor)
+            cursor += timedelta(days=1)
+        service_dates_cache[service_id] = dates
+        return dates
+
+    for stop_id in stop_ids:
+        for trip_id, departure_seconds in index.stop_entries.get(stop_id, []):
+            route = index.trip_route.get(trip_id, "")
+            direction = index.trip_direction.get(trip_id, "")
+
+            if route_filter:
+                if not route:
+                    continue
+                if route not in route_filter:
+                    continue
+
+            if not _matches_widget_text_filters(widget, direction):
+                continue
+
+            service_id = index.trip_service.get(trip_id, "")
+            if not service_id:
+                continue
+
+            for service_day in service_dates_for(service_id):
+                departure_local = datetime.combine(service_day, datetime.min.time(), tzinfo=LOCAL_TIMEZONE) + timedelta(
+                    seconds=departure_seconds
+                )
+                departure_epoch = int(departure_local.timestamp())
+                if departure_epoch < now_epoch or departure_epoch > max_time_epoch:
+                    continue
+
+                dedup_key = (trip_id, departure_epoch, stop_id)
+                if dedup_key in seen_keys:
+                    continue
+                seen_keys.add(dedup_key)
+
+                in_min = max(0, int((departure_epoch - now_epoch) // 60))
+                departures.append(
+                    Departure(
+                        route=route,
+                        direction=direction,
+                        platform=None,
+                        stop_id=stop_id,
+                        time_epoch=departure_epoch,
+                        time_local=departure_local.strftime("%H:%M"),
+                        in_min=in_min,
+                        delay_s=None,
+                        trip_id=trip_id,
+                    )
+                )
+
+    departures.sort(key=lambda item: item.time_epoch)
+    return departures
+
+
+def merge_departures_realtime_with_fallback(
+    realtime_departures: list[Departure],
+    fallback_departures: list[Departure],
+    max_departures: int,
+) -> list[Departure]:
+    merged: list[Departure] = list(realtime_departures)
+    seen_keys = {(dep.trip_id, dep.time_epoch, dep.stop_id) for dep in merged}
+
+    for dep in fallback_departures:
+        dedup_key = (dep.trip_id, dep.time_epoch, dep.stop_id)
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        merged.append(dep)
+
+    merged.sort(key=lambda item: item.time_epoch)
+    return merged[: max_departures]
 
 
 def collect_realtime_trip_context(
@@ -1311,13 +1678,14 @@ async def poll_once(state: RuntimeState) -> None:
             parse_elapsed = time.monotonic() - parse_started
 
             configured_stop_ids = set(all_widget_stop_ids(state.config, source="gtfs_rt"))
-            missing_stop_ids_started = time.monotonic()
-            missing_stop_ids = set(find_missing_stop_ids(feed_message, list(configured_stop_ids)))
-            missing_stop_ids_elapsed = time.monotonic() - missing_stop_ids_started
+            await refresh_known_stop_ids_if_due(state)
+            async with state.lock:
+                known_stop_ids = set(state.known_stop_ids)
+                known_stop_ids_error = state.known_stop_ids_error
             debug_log(
                 "poll_once:gtfs_feed_ready "
-                f"bytes={len(feed_bytes)} entities={len(feed_message.entity)} missing_stop_ids={len(missing_stop_ids)} "
-                f"fetch_s={feed_fetch_elapsed:.2f} parse_s={parse_elapsed:.2f} missing_s={missing_stop_ids_elapsed:.2f}"
+                f"bytes={len(feed_bytes)} entities={len(feed_message.entity)} known_stop_ids={len(known_stop_ids)} "
+                f"fetch_s={feed_fetch_elapsed:.2f} parse_s={parse_elapsed:.2f}"
             )
 
             enrich_started = time.monotonic()
@@ -1372,6 +1740,10 @@ async def poll_once(state: RuntimeState) -> None:
                     f"duration_s={time.monotonic() - enrich_started:.2f}"
                 )
 
+            static_fallback_index: Optional[StaticFallbackIndex] = None
+            static_fallback_error: Optional[str] = None
+            static_fallback_loaded = False
+
             for widget in gtfs_widgets:
                 widget_started = time.monotonic()
                 widget_errors = errors_by_widget[widget.id]
@@ -1383,11 +1755,38 @@ async def poll_once(state: RuntimeState) -> None:
                     widget_errors.append(
                         f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfügbar."
                     )
+                if not known_stop_ids and known_stop_ids_error:
+                    widget_errors.append(f"Stop-ID-Validierung aktuell nicht verfügbar: {known_stop_ids_error}")
                 for stop_id in widget.stop_ids:
-                    if stop_id in missing_stop_ids:
+                    if known_stop_ids and stop_id not in known_stop_ids:
                         widget_errors.append(f"Falsche Konfiguration: Stop-ID {stop_id} nicht gefunden.")
 
                 departures = extract_departures(feed_message, widget, route_map, trip_destination_map, now_epoch)
+                realtime_count = len(departures)
+
+                if realtime_count < widget.max_departures and widget.stop_ids:
+                    if not static_fallback_loaded:
+                        await refresh_static_fallback_index_if_due(state)
+                        async with state.lock:
+                            static_fallback_index = state.static_fallback_index
+                            static_fallback_error = state.static_fallback_error
+                        static_fallback_loaded = True
+
+                    if static_fallback_index is not None:
+                        fallback_departures = extract_static_schedule_departures(widget, static_fallback_index, now_epoch)
+                        departures = merge_departures_realtime_with_fallback(
+                            departures,
+                            fallback_departures,
+                            widget.max_departures,
+                        )
+                        debug_log(
+                            "poll_once:gtfs_fallback "
+                            f"widget={widget.id} realtime={realtime_count} fallback_candidates={len(fallback_departures)} "
+                            f"merged={len(departures)}"
+                        )
+                    elif static_fallback_error and realtime_count == 0:
+                        widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfügbar: {static_fallback_error}")
+
                 departures_by_widget[widget.id] = departures
                 total_departures += len(departures)
                 debug_log(
@@ -1455,6 +1854,81 @@ async def ensure_data_fresh(state: RuntimeState, force: bool = False) -> None:
                     state.refresh_task = None
 
 
+async def refresh_known_stop_ids_if_due(state: RuntimeState, force: bool = False) -> None:
+    now_monotonic = time.monotonic()
+    async with state.lock:
+        should_reload = force or not state.known_stop_ids or now_monotonic >= state.next_known_stop_ids_reload_monotonic
+        timeout_seconds = max(30, state.config.feed.http_timeout_seconds * 2)
+        reload_in_seconds = max(300, min(state.config.mapping.reload_every_seconds, 3600))
+        cached_count = len(state.known_stop_ids)
+    if not should_reload:
+        return
+
+    started_at = time.monotonic()
+    stop_ids, load_error = await asyncio.to_thread(load_known_stop_ids_from_static_gtfs, timeout_seconds)
+    async with state.lock:
+        if stop_ids:
+            state.known_stop_ids = set(stop_ids)
+            state.known_stop_ids_error = None
+        elif load_error:
+            state.known_stop_ids_error = load_error
+        state.next_known_stop_ids_reload_monotonic = time.monotonic() + reload_in_seconds
+
+    debug_log(
+        "mapping_static:known_stops_refresh "
+        f"loaded={len(stop_ids)} cached_before={cached_count} had_error={bool(load_error)} "
+        f"next_in_s={reload_in_seconds} duration_s={time.monotonic() - started_at:.2f}"
+    )
+
+
+async def refresh_static_fallback_index_if_due(state: RuntimeState, force: bool = False) -> None:
+    target_stop_ids = all_widget_stop_ids(state.config, source="gtfs_rt")
+    if not target_stop_ids:
+        return
+
+    now_monotonic = time.monotonic()
+    async with state.lock:
+        should_reload = (
+            force
+            or state.static_fallback_index is None
+            or now_monotonic >= state.next_static_fallback_reload_monotonic
+        )
+        timeout_seconds = max(45, state.config.feed.http_timeout_seconds * 6)
+        reload_in_seconds = max(900, min(state.config.mapping.reload_every_seconds * 6, 7200))
+        cached_entries = (
+            sum(len(items) for items in state.static_fallback_index.stop_entries.values())
+            if state.static_fallback_index is not None
+            else 0
+        )
+    if not should_reload:
+        return
+
+    started_at = time.monotonic()
+    index, load_error = await asyncio.to_thread(
+        load_static_fallback_index_for_stop_ids,
+        target_stop_ids,
+        timeout_seconds,
+    )
+
+    loaded_entries = 0
+    if index is not None:
+        loaded_entries = sum(len(items) for items in index.stop_entries.values())
+
+    async with state.lock:
+        if index is not None:
+            state.static_fallback_index = index
+            state.static_fallback_error = None
+        elif load_error:
+            state.static_fallback_error = load_error
+        state.next_static_fallback_reload_monotonic = time.monotonic() + reload_in_seconds
+
+    debug_log(
+        "fallback_static:refresh "
+        f"stop_ids={len(target_stop_ids)} loaded_entries={loaded_entries} cached_before={cached_entries} "
+        f"had_error={bool(load_error)} next_in_s={reload_in_seconds} duration_s={time.monotonic() - started_at:.2f}"
+    )
+
+
 async def run_static_cache_warmup(state: RuntimeState) -> None:
     started_at = time.monotonic()
     gtfs_widgets = [widget for widget in state.config.widgets if widget.source == "gtfs_rt"]
@@ -1475,6 +1949,8 @@ async def run_static_cache_warmup(state: RuntimeState) -> None:
         "warmup_static_cache:done "
         f"bytes={len(payload)} widgets={len(gtfs_widgets)} duration_s={time.monotonic() - started_at:.2f}"
     )
+    await refresh_known_stop_ids_if_due(state, force=True)
+    await refresh_static_fallback_index_if_due(state, force=True)
 
 async def run_startup_warmup(state: RuntimeState) -> None:
     started_at = time.monotonic()
@@ -1940,29 +2416,6 @@ def create_app(config: AppConfig) -> FastAPI:
             errors = list(state.errors_by_widget.get(widget.id, []))
         return HTMLResponse(render_widget_html(widget, departures, fetched_at_epoch, f"/json/{widget.id}", errors))
 
-    @app.get("/json", response_class=JSONResponse)
-    async def get_json_default() -> JSONResponse:
-        # Backward compatible default: first configured widget.
-        if not config.widgets:
-            raise HTTPException(status_code=500, detail="No widgets configured.")
-        first_widget = config.widgets[0]
-        await ensure_data_fresh(state)
-        async with state.lock:
-            departures = [dep.to_dict() for dep in state.departures_by_widget.get(first_widget.id, [])]
-            fetched_at_epoch = state.fetched_at_epoch
-            errors = list(state.errors_by_widget.get(first_widget.id, []))
-        payload = {
-            "widget_id": first_widget.id,
-            "widget_title": first_widget.title,
-            "fetched_at": fetched_at_epoch,
-            "age_s": age_seconds(fetched_at_epoch),
-            "departures": departures,
-            "errors": errors,
-            "widgets": [{"id": w.id, "title": w.title} for w in config.widgets],
-            "config": build_config_excerpt(config),
-        }
-        return JSONResponse(payload)
-
     @app.get("/json/{widget_id}", response_class=JSONResponse)
     async def get_json(widget_id: str) -> JSONResponse:
         widget = find_widget(config, widget_id)
@@ -1998,6 +2451,32 @@ def create_app(config: AppConfig) -> FastAPI:
                 "ok": True,
                 "age_s": age_seconds(fetched_at_epoch),
                 "errors": aggregated_errors,
+            }
+        )
+
+    @app.get("/debug", response_class=JSONResponse)
+    async def get_debug_config() -> JSONResponse:
+        return JSONResponse(get_debug_status())
+
+    @app.post("/debug/on", response_class=JSONResponse)
+    async def enable_debug(log_path: Optional[str] = None) -> JSONResponse:
+        ok, message = configure_debug_logger(True, log_path)
+        return JSONResponse(
+            {
+                "ok": ok,
+                "message": message,
+                **get_debug_status(),
+            }
+        )
+
+    @app.post("/debug/off", response_class=JSONResponse)
+    async def disable_debug() -> JSONResponse:
+        _ok, message = configure_debug_logger(False)
+        return JSONResponse(
+            {
+                "ok": True,
+                "message": message,
+                **get_debug_status(),
             }
         )
 
