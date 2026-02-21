@@ -1,4 +1,4 @@
-﻿# timetable-widget
+# timetable-widget
 
 Container-Projekt für ein konfigurierbares Abfahrts-Widget (HTML) plus JSON-Endpoint für Integration in Drittsysteme. Ursprünglich war es für die Integration in ein openHAB Smart-Home-System gedacht, siehe hierzu auch https://www.forwardme.de/2026/02/20/openhab-oepnv-timetable-widget-per-docker-container-integriert/
 
@@ -26,6 +26,7 @@ Hinweis zu Windows/Docker Desktop:
 - In manchen Setups (insbesondere bei Netzlaufwerken) wird ein Datei-Bind-Mount als Verzeichnis interpretiert.
 - Deshalb ist der Compose-Standard hier ohne Datei-Bind-Mount umgesetzt.
 - Falls `CONFIG_PATH` auf ein Verzeichnis zeigt, nutzt die App automatisch einen Fallback (`FALLBACK_CONFIG_PATH`).
+- `docker-compose.yml` muss an deine Umgebung angepasst werden (insbesondere Volume-Pfade für `config.yaml`, `data`, `logs` und ggf. Port-Mapping).
 
 ```bash
 docker compose up -d --build
@@ -164,7 +165,7 @@ Variante A: Container Manager Projekt (empfohlen)
 4. `.env` im Projektordner anlegen (aus `.env.example`) und DB-Werte setzen:
    - `DB_CLIENT_ID=<deine_client_id>`
    - `DB_API_KEY=<dein_api_key>`
-5. `docker-compose.yml` wird erkannt. Optional Environment setzen:
+5. `docker-compose.yml` wird erkannt. Vor dem Start Pfade und Mounts an die eigene NAS-Struktur anpassen (Config/Logs/Data). Optional Environment setzen:
    - `USER_AGENT` falls gewünscht
    - `DEBUG_MODE=1` und `DEBUG_LOG_PATH=/logs/logfile.txt` falls Debug
    - `WARMUP_STATIC_CACHE_ON_START=1` für Static-Cache-Warmup
@@ -304,11 +305,3 @@ Bitte bezüglich des eigenen Einsatzes selbst jeweils die rechtlichen Rahmenbedi
 - Vorteil: Der erste Widget-Aufruf muss den großen Static-Download nicht mehr selbst auslösen.
 - `WARMUP_ON_START=1` (optional): führt zusätzlich einen kompletten Daten-Warmup aus.
 - Hinweis: Warmup verlagert Wartezeit auf den Container-Start und kann den Start verlangsamen.
-
-
-
-
-
-
-
-
