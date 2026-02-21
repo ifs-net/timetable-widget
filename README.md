@@ -2,6 +2,10 @@
 
 Container-Projekt für ein konfigurierbares Abfahrts-Widget (HTML) plus JSON-Endpoint für Integration in Drittsysteme. Ursprünglich war es für die Integration in ein openHAB Smart-Home-System gedacht, siehe hierzu auch https://www.forwardme.de/2026/02/20/openhab-oepnv-timetable-widget-per-docker-container-integriert/
 
+Konkret integriert werden sollten für meinen Fall Bahnverbindungen eines nahen Bahnhofs Richtung Regensburg Zentrum sowie die Abfahrtszeiten und Live-Daten zu den Busverbindungen des RVV (Regensburger Verkehrsverbunds) zweier Haltestellen nahe meines Wohnorts.
+
+Die Lösugn ist aber nicht auf den RVV beschränkt sondern universal einsetzbar für alle in den genutzten Quellen enthaltenen Verkehrsverbünden.
+
 ## Setup
 
 ```bash
