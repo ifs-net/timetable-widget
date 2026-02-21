@@ -53,7 +53,9 @@ widgets:
   - id: "1"
     title: "Dechbetten/TELIS FINANZ"
     source: "gtfs_rt"
-    stop_ids: ["27741", "647898"]
+    stop_ids:
+      - "27741"   # Dechbetten/TELIS FINANZ (aktive Richtung 1, Regensburg)
+      - "647898"  # Dechbetten/TELIS FINANZ (aktive Richtung 2, Regensburg)
     gtfs_lookahead_hours: 24
     max_departures: 8
     show_delay: true
@@ -62,11 +64,23 @@ widgets:
   - id: "2"
     title: "Bahnhof Prüfening"
     source: "db_iris"
-    db_eva_no: "8004983"
+    db_eva_no: "8004983"  # DB/EVA: Regensburg-Prüfening
     direction_contains: ["Regensburg Hbf"]
     db_only_trains: true
     db_use_fchg: true
     db_lookahead_hours: 24
+    max_departures: 8
+    show_delay: true
+    show_feed_age: true
+
+  - id: "3"
+    title: "Lilienthalstraße"
+    source: "gtfs_rt"
+    stop_ids:
+      - "406702"  # Lilienthalstraße (Regensburg, Richtung A)
+      - "8593"    # Lilienthalstraße (Regensburg, Richtung B)
+      - "86805"   # Lilienthalstraße (Regensburg, weitere Steig-/Richtungs-ID)
+    gtfs_lookahead_hours: 24
     max_departures: 8
     show_delay: true
     show_feed_age: true
