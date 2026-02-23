@@ -7,3 +7,7 @@ config.yaml
 .env
 .codex/
 temp_backups/
+
+config/direction_overrides.txt
+config/config.yaml
+
