@@ -4,7 +4,7 @@ services:
     container_name: timetable-widget
     restart: unless-stopped
     volumes:
-      - /volume1/docker/timetable-widget-mount/config.yaml:/config/config.yaml:ro
+      - /volume1/docker/timetable-widget-mount/config:/config
       - /volume1/docker/timetable-widget-mount/data:/data
       - /volume1/docker/timetable-widget-mount/logs:/logs
     environment:
@@ -12,13 +12,18 @@ services:
       - FALLBACK_CONFIG_PATH=${FALLBACK_CONFIG_PATH:-/app/config.example.yaml}
       - DEBUG_MODE=${DEBUG_MODE:-0}
       - DEBUG_LOG_PATH=${DEBUG_LOG_PATH:-/logs/logfile.txt}
+      - LOG_INSTANCE_IP=${LOG_INSTANCE_IP:-}
       - WARMUP_ON_START=${WARMUP_ON_START:-0}
       - WARMUP_STATIC_CACHE_ON_START=${WARMUP_STATIC_CACHE_ON_START:-1}
       - USER_AGENT=${USER_AGENT:-Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36}
       - DB_TIMETABLES_BASE_URL=${DB_TIMETABLES_BASE_URL:-https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1}
       - DB_CLIENT_ID=${DB_CLIENT_ID:-}
       - DB_API_KEY=${DB_API_KEY:-}
+      - DIRECTION_MAPPING_PATH=${DIRECTION_MAPPING_PATH:-/config/direction_overrides.txt}
+      - DIRECTION_MAPPING_SEPARATOR=${DIRECTION_MAPPING_SEPARATOR:-|}
+      - DIRECTION_MAPPING_RELOAD_SECONDS=${DIRECTION_MAPPING_RELOAD_SECONDS:-15}
     ports:
       # Wenn server.port in der YAML geaendert wird, muss dieses Mapping angepasst werden.
       # Empfehlung: intern bei 8000 bleiben und nur den externen Port anpassen.
       - "8000:8000"
+
