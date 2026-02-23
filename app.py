@@ -541,8 +541,12 @@ def load_yaml(path: str) -> dict:
         target = replacement
 
     if not target.is_file():
-        raise ValueError(f"config file not found: {target}")
-
+        fallback = Path(FALLBACK_CONFIG_PATH)
+        if fallback.is_file():
+            debug_log(f"load_yaml: config file not found at {target}; using fallback file {fallback}")
+            target = fallback
+        else:
+            raise ValueError(f"config file not found: {target}")
     with target.open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
     if not isinstance(data, dict):
@@ -2971,6 +2975,68 @@ def render_widget_index_html(config: AppConfig, base_url: str) -> str:
 </html>
 """
 
+
+def render_service_index_html(config: AppConfig, base_url: str) -> str:
+    root = base_url.rstrip("/")
+    endpoint_rows = [
+        ("Widget-Übersicht", f"{root}/widget", "Alle konfigurierten Widgets mit Direkt-URLs"),
+        ("Widget (Standard)", f"{root}/widget/<id>", "Nächste Abfahrten je Widget-ID"),
+        ("Widget (24h)", f"{root}/widget/<id>/24h", "Alle Abfahrten der nächsten 24 Stunden"),
+        ("JSON (Standard)", f"{root}/json/<id>", "JSON-Daten für Standardansicht"),
+        ("JSON (24h)", f"{root}/json/<id>/24h", "JSON-Daten für 24h-Ansicht"),
+        ("Health", f"{root}/health", "Technischer Status und Feed-Alter"),
+        ("Debug-Status", f"{root}/debug", "Aktueller Debug-Modus"),
+        ("OpenAPI", f"{root}/docs", "Interaktive API-Dokumentation"),
+    ]
+    widget_links = "".join(
+        f"<li><a href='{html.escape(f'{root}/widget/{widget.id}')}'>{html.escape(widget.title)}"
+        f" (ID {html.escape(widget.id)})</a></li>"
+        for widget in config.widgets
+    )
+    if not widget_links:
+        widget_links = "<li>Keine Widgets konfiguriert.</li>"
+
+    endpoint_html = "".join(
+        "<tr>"
+        f"<td>{html.escape(name)}</td>"
+        f"<td><code>{html.escape(url)}</code></td>"
+        f"<td>{html.escape(description)}</td>"
+        "</tr>"
+        for name, url, description in endpoint_rows
+    )
+
+    return f"""<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>timetable-widget API</title>
+  <style>
+    body {{ font-family: "Segoe UI", Tahoma, sans-serif; margin: 16px; background: #f5f7fb; color: #1f2937; }}
+    h2 {{ margin: 0 0 10px; }}
+    .hint {{ margin-bottom: 12px; color: #374151; }}
+    table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d1d5db; border-radius: 8px; overflow: hidden; }}
+    th, td {{ padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: left; font-size: 14px; vertical-align: top; }}
+    th {{ background: #0b4f8a; color: #fff; }}
+    code {{ background: #eef2ff; padding: 1px 4px; border-radius: 4px; }}
+    a {{ color: #0b4f8a; text-decoration: none; }}
+  </style>
+</head>
+<body>
+  <h2>timetable-widget</h2>
+  <p class="hint">Technische Startseite. Für die Widget-Ansicht direkt <a href="{html.escape(f'{root}/widget')}"><code>/widget</code></a> aufrufen.</p>
+  <table>
+    <thead>
+      <tr><th>Endpunkt</th><th>URL</th><th>Beschreibung</th></tr>
+    </thead>
+    <tbody>{endpoint_html}</tbody>
+  </table>
+  <h3>Konfigurierte Widgets</h3>
+  <ul>{widget_links}</ul>
+</body>
+</html>
+"""
+
 def build_config_excerpt(config: AppConfig) -> dict:
     return {
         "server": {
@@ -3023,6 +3089,9 @@ def create_app(config: AppConfig) -> FastAPI:
     app = FastAPI(title="timetable-widget", lifespan=lifespan)
     app.state.runtime = state
 
+    @app.get("/", response_class=HTMLResponse)
+    async def get_service_index(request: Request) -> HTMLResponse:
+        return HTMLResponse(render_service_index_html(config, str(request.base_url)))
     @app.get("/widget", response_class=HTMLResponse)
     async def get_widget_overview(request: Request) -> HTMLResponse:
         return HTMLResponse(render_widget_index_html(config, str(request.base_url)))
@@ -3121,5 +3190,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 

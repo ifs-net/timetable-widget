@@ -4,9 +4,9 @@
     container_name: timetable-widget
     restart: unless-stopped
     volumes:
-      - /volume1/docker/timetable-widget-mount/config:/config
-      - /volume1/docker/timetable-widget-mount/data:/data
-      - /volume1/docker/timetable-widget-mount/logs:/logs
+      - ${CONFIG_DIR:-./config}:/config
+      - ${DATA_DIR:-./data}:/data
+      - ${LOGS_DIR:-./logs}:/logs
     environment:
       - CONFIG_PATH=${CONFIG_PATH:-/config/config.yaml}
       - FALLBACK_CONFIG_PATH=${FALLBACK_CONFIG_PATH:-/app/config/config.yaml.example}
@@ -26,5 +26,3 @@
       # Wenn server.port in der YAML geaendert wird, muss dieses Mapping angepasst werden.
       # Empfehlung: intern bei 8000 bleiben und nur den externen Port anpassen.
       - "8000:8000"
-
-

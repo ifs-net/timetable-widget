@@ -2,7 +2,7 @@
 
 ARG APP_UID=10001
 ARG APP_GID=10001
-ARG APP_VERSION=1.1.1
+ARG APP_VERSION=1.1.2
 
 LABEL org.opencontainers.image.title="timetable-widget" \
       org.opencontainers.image.description="Konfigurierbares ÖPNV-Abfahrts-Widget mit GTFS-Realtime und DB-Timetables" \
@@ -32,4 +32,5 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 CMD python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).getcode() == 200 else 1)"
 
 CMD ["python", "-u", "app.py"]
+
 

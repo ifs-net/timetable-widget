@@ -22,7 +22,7 @@ DB_API_KEY=<dein_api_key>
 ```
 
 `config/config.yaml` anpassen, insbesondere `widgets`.
-Compose-Standard: Die Konfiguration wird aus `/config/config.yaml` geladen (Host-Mount `.../config:/config`).
+Compose-Standard: Die Konfiguration wird aus `/config/config.yaml` geladen (Host-Mount `${CONFIG_DIR:-./config}:/config`).
 Wenn `config/config.yaml` lokal geändert wird, reicht ein Container-Neustart (`docker compose restart`).
 Hinweis: Beim ersten Start nach einem Build kann die App länger in `Waiting for application startup` stehen,
 da der statische GTFS-Fallback-Index aufgebaut wird.
@@ -31,7 +31,7 @@ Hinweis zu Windows/Docker Desktop:
 - In manchen Setups (insbesondere bei Netzlaufwerken) wird ein Datei-Bind-Mount als Verzeichnis interpretiert.
 - Deshalb ist der Compose-Standard hier ohne Datei-Bind-Mount umgesetzt.
 - Falls `CONFIG_PATH` auf ein Verzeichnis zeigt, nutzt die App automatisch einen Fallback (`FALLBACK_CONFIG_PATH`).
-- `docker-compose.yml` muss an deine Umgebung angepasst werden (insbesondere Volume-Pfade für `config` inkl. `config.yaml` und `direction_overrides.txt`, `data`, `logs` und ggf. Port-Mapping).
+- `docker-compose.yml` nutzt standardmaessig lokale Projektordner (`./config`, `./data`, `./logs`). Optional per `.env`: `CONFIG_DIR`, `DATA_DIR`, `LOGS_DIR`.
 
 ```bash
 docker compose up -d --build
@@ -44,6 +44,7 @@ docker compose up -d --build
 - `http://<Docker-Container-IP>:8000/widget/1/24h` (konkretes Widget nach ID, alle Abfahrten der nächsten 24h)
 - `http://<Docker-Container-IP>:8000/json/1` (JSON für konkretes Widget nach ID, Standardansicht)
 - `http://<Docker-Container-IP>:8000/json/1/24h` (JSON für konkretes Widget nach ID, 24h-Ansicht)
+- `http://<Docker-Container-IP>:8000/` (technische Startseite mit Endpunkt-Uebersicht)
 - `http://<Docker-Container-IP>:8000/health`
 
 ## Widget-Konfiguration

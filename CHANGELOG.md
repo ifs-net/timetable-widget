@@ -1,7 +1,17 @@
-# Changelog
+﻿# Changelog
 
-Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
+Alle relevanten Ã„nderungen dieses Projekts werden hier dokumentiert.
 
+## [1.1.2] - 2026-02-23
+
+### Geaendert
+- Root-Endpunkt (`/`) liefert jetzt eine technische Startseite mit Links auf Widget-, JSON-, Health- und Debug-Endpunkte.
+- `docker-compose.yml` nutzt standardmaessig projektlokale Mounts (`./config`, `./data`, `./logs`) und kann per `CONFIG_DIR`, `DATA_DIR`, `LOGS_DIR` uebersteuert werden.
+- `.env.example` um die neuen optionalen Mount-Variablen ergaenzt.
+- README auf neue Root-URL und Compose-Mount-Defaults aktualisiert.
+
+### Behoben
+- Konfigurationsladen faellt jetzt auf `FALLBACK_CONFIG_PATH` zurueck, wenn `CONFIG_PATH` auf eine nicht vorhandene Datei zeigt.
 ## [1.1.1] - 2026-02-23
 
 ### Ge?ndert
@@ -15,26 +25,27 @@ Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
 
 ## [1.1.0] - 2026-02-23
 
-### Hinzugefügt
-- Richtungs-Overrides aus Datei (`config/direction_overrides.txt`) mit automatischer Erkennung neuer Einträge.
-- Konfigurationsstruktur unter `config/` mit Vorlagen für `config.yaml` und Richtungs-Overrides.
-- Zusätzliche Umgebungsvariablen: `DIRECTION_MAPPING_SEPARATOR` und `LOG_INSTANCE_IP`.
+### HinzugefÃ¼gt
+- Richtungs-Overrides aus Datei (`config/direction_overrides.txt`) mit automatischer Erkennung neuer EintrÃ¤ge.
+- Konfigurationsstruktur unter `config/` mit Vorlagen fÃ¼r `config.yaml` und Richtungs-Overrides.
+- ZusÃ¤tzliche Umgebungsvariablen: `DIRECTION_MAPPING_SEPARATOR` und `LOG_INSTANCE_IP`.
 
-### Geändert
+### GeÃ¤ndert
 - Docker-Setup auf gemeinsamen Config-Mount (`/config`) umgestellt.
 - Doku auf aktuelle Funktionen erweitert (24h-Ansicht, Mapping, Synology-Setup, Debug-Optionen).
-- Beispiele für Richtungs-Overrides aktualisiert (`VMG`, `Stadt/Goethe`).
+- Beispiele fÃ¼r Richtungs-Overrides aktualisiert (`VMG`, `Stadt/Goethe`).
 
 ### Behoben
-- Doppelte GTFS-Einträge aus Echtzeit + statischem Fallback stärker dedupliziert (Echtzeit hat Vorrang, auch bei Zeitabweichungen).
+- Doppelte GTFS-EintrÃ¤ge aus Echtzeit + statischem Fallback stÃ¤rker dedupliziert (Echtzeit hat Vorrang, auch bei Zeitabweichungen).
 - Umlaute und Zeichenkodierung in der Dokumentation bereinigt.
 
 ## [1.0.0] - 2026-02-21
 
 ### Initiales Release
-- Erstveröffentlichung von `timetable-widget`.
-- Mehrere Widgets über `widgets`-Konfiguration.
+- ErstverÃ¶ffentlichung von `timetable-widget`.
+- Mehrere Widgets Ã¼ber `widgets`-Konfiguration.
 - GTFS-Realtime- und DB-Timetables-Integration.
 - HTML-Widget und JSON-Endpunkte pro Widget-ID.
 - On-Demand-Refresh mit Caching, Warmup-Optionen und Debug-Logging.
 - Statischer GTFS-Fallback inklusive Fahrtrichtungsermittlung.
+
