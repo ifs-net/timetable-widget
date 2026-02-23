@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import asyncio
 import csv
+import fnmatch
 import html
 import io
 import json
@@ -12,7 +15,7 @@ import time
 import xml.etree.ElementTree as ET
 import zipfile
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -52,6 +55,14 @@ try:
     LOCAL_TIMEZONE = ZoneInfo(LOCAL_TIMEZONE_NAME)
 except ZoneInfoNotFoundError:
     LOCAL_TIMEZONE = ZoneInfo("UTC")
+
+DIRECTION_MAPPING_PATH = os.getenv("DIRECTION_MAPPING_PATH", "/config/direction_overrides.txt")
+DIRECTION_MAPPING_SEPARATOR = os.getenv("DIRECTION_MAPPING_SEPARATOR", "|")
+try:
+    DIRECTION_MAPPING_RELOAD_SECONDS = int(os.getenv("DIRECTION_MAPPING_RELOAD_SECONDS", "15"))
+except ValueError:
+    DIRECTION_MAPPING_RELOAD_SECONDS = 15
+DIRECTION_MAPPING_FILE_LOCK = threading.Lock()
 
 
 def to_local_datetime(epoch_seconds: int) -> datetime:
@@ -165,6 +176,224 @@ def debug_log(message: str) -> None:
         logger.info(message)
 
 
+def _normalize_direction_mapping_value(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    # tolerate replacement characters from bad encodings (e.g. Universit?t)
+    text = text.replace("?", "?")
+    return text
+
+
+def _normalize_direction_mapping_key(route: str, direction: str) -> tuple[str, str]:
+    return _normalize_direction_mapping_value(route), _normalize_direction_mapping_value(direction)
+
+
+def _is_wildcard_pattern(value: str) -> bool:
+    return "?" in value or "*" in value
+
+
+def _matches_direction_pattern(
+    route_key: str,
+    direction_key: str,
+    patterns: list[tuple[str, str, str]],
+) -> Optional[str]:
+    for route_pattern, direction_pattern, label in patterns:
+        if fnmatch.fnmatchcase(route_key, route_pattern) and fnmatch.fnmatchcase(direction_key, direction_pattern):
+            return label
+    return None
+
+
+def _sanitize_direction_mapping_field(value: str) -> str:
+    text = re.sub(r"[\r\n]+", " ", str(value or "")).strip()
+    if DIRECTION_MAPPING_SEPARATOR:
+        text = text.replace(DIRECTION_MAPPING_SEPARATOR, "/")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def load_direction_mapping_file(
+    path: str,
+) -> tuple[dict[tuple[str, str], str], list[tuple[str, str, str]], set[tuple[str, str]], Optional[str]]:
+    target = Path(path)
+    mapping: dict[tuple[str, str], str] = {}
+    patterns: list[tuple[str, str, str]] = []
+    known_keys: set[tuple[str, str]] = set()
+
+    try:
+        with DIRECTION_MAPPING_FILE_LOCK:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_text("# route|direction|label\n", encoding="utf-8")
+                return mapping, patterns, known_keys, None
+
+            lines = target.read_text(encoding="utf-8").splitlines()
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(DIRECTION_MAPPING_SEPARATOR)
+            if len(parts) < 2:
+                continue
+            route = _sanitize_direction_mapping_field(parts[0])
+            direction = _sanitize_direction_mapping_field(parts[1])
+            label = _sanitize_direction_mapping_field(parts[2]) if len(parts) >= 3 else ""
+            if not route or not direction:
+                continue
+
+            route_key = _normalize_direction_mapping_value(route)
+            direction_key = _normalize_direction_mapping_value(direction)
+            key = (route_key, direction_key)
+            known_keys.add(key)
+
+            if _is_wildcard_pattern(route_key) or _is_wildcard_pattern(direction_key):
+                patterns.append((route_key, direction_key, label))
+            else:
+                mapping[key] = label
+        return mapping, patterns, known_keys, None
+    except Exception as exc:
+        return mapping, patterns, known_keys, f"direction mapping load failed: {exc}"
+
+
+def append_direction_mapping_entries(
+    path: str,
+    observed_entries: list[tuple[str, str]],
+    known_keys: set[tuple[str, str]],
+) -> tuple[int, set[tuple[str, str]], Optional[str]]:
+    if not observed_entries:
+        return 0, set(), None
+
+    target = Path(path)
+    existing_keys = set(known_keys)
+    added_keys: set[tuple[str, str]] = set()
+    added_count = 0
+
+    try:
+        with DIRECTION_MAPPING_FILE_LOCK:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_text("# route|direction|label\n", encoding="utf-8")
+
+            for raw_line in target.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(DIRECTION_MAPPING_SEPARATOR)
+                if len(parts) < 2:
+                    continue
+                route = _sanitize_direction_mapping_field(parts[0])
+                direction = _sanitize_direction_mapping_field(parts[1])
+                if not route or not direction:
+                    continue
+                existing_keys.add(_normalize_direction_mapping_key(route, direction))
+
+            with target.open("a", encoding="utf-8") as handle:
+                for route_raw, direction_raw in observed_entries:
+                    route = _sanitize_direction_mapping_field(route_raw)
+                    direction = _sanitize_direction_mapping_field(direction_raw)
+                    if not route or not direction:
+                        continue
+                    key = _normalize_direction_mapping_key(route, direction)
+                    if key in existing_keys or key in added_keys:
+                        continue
+                    handle.write(f"{route}{DIRECTION_MAPPING_SEPARATOR}{direction}{DIRECTION_MAPPING_SEPARATOR}\n")
+                    added_keys.add(key)
+                    added_count += 1
+        return added_count, added_keys, None
+    except Exception as exc:
+        return added_count, added_keys, f"direction mapping append failed: {exc}"
+
+
+def apply_direction_labels(
+    departures: list[Departure],
+    direction_labels: dict[tuple[str, str], str],
+    direction_label_patterns: list[tuple[str, str, str]],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    observed: dict[tuple[str, str], tuple[str, str]] = {}
+    for dep in departures:
+        dep.direction_label = None
+        route = str(dep.route or "").strip()
+        direction = str(dep.direction or "").strip()
+        if not route or not direction:
+            continue
+        key = _normalize_direction_mapping_key(route, direction)
+        label = str(direction_labels.get(key, "") or "").strip()
+        if not label and direction_label_patterns:
+            wildcard_label = _matches_direction_pattern(key[0], key[1], direction_label_patterns)
+            if wildcard_label is not None:
+                label = str(wildcard_label or "").strip()
+        if label:
+            dep.direction_label = label
+        observed.setdefault(key, (route, direction))
+    return observed
+
+
+async def refresh_direction_mapping_if_due(state: RuntimeState, force: bool = False) -> None:
+    now_monotonic = time.monotonic()
+    async with state.lock:
+        should_reload = (
+            force
+            or not state.known_direction_keys
+            or now_monotonic >= state.next_direction_mapping_reload_monotonic
+        )
+    if not should_reload:
+        return
+
+    mapping, patterns, known_keys, load_error = await asyncio.to_thread(load_direction_mapping_file, DIRECTION_MAPPING_PATH)
+    async with state.lock:
+        state.direction_labels = mapping
+        state.direction_label_patterns = patterns
+        state.known_direction_keys = known_keys
+        state.direction_mapping_error = load_error
+        state.next_direction_mapping_reload_monotonic = time.monotonic() + max(5, DIRECTION_MAPPING_RELOAD_SECONDS)
+
+    debug_log(
+        "direction_mapping:refresh "
+        f"keys={len(known_keys)} labels={sum(1 for value in mapping.values() if value)} patterns={len(patterns)} "
+        f"error={bool(load_error)}"
+    )
+
+
+async def register_observed_direction_entries(
+    state: RuntimeState,
+    observed: dict[tuple[str, str], tuple[str, str]],
+) -> None:
+    if not observed:
+        return
+
+    async with state.lock:
+        known_keys = set(state.known_direction_keys)
+        direction_label_patterns = list(state.direction_label_patterns)
+
+    missing_entries: list[tuple[str, str]] = []
+    for key, raw_value in observed.items():
+        if key in known_keys:
+            continue
+        if _matches_direction_pattern(key[0], key[1], direction_label_patterns) is not None:
+            continue
+        missing_entries.append(raw_value)
+
+    if not missing_entries:
+        return
+
+    added_count, added_keys, write_error = await asyncio.to_thread(
+        append_direction_mapping_entries,
+        DIRECTION_MAPPING_PATH,
+        missing_entries,
+        known_keys,
+    )
+
+    async with state.lock:
+        if write_error:
+            state.direction_mapping_error = write_error
+        for key in added_keys:
+            state.known_direction_keys.add(key)
+            state.direction_labels.setdefault(key, "")
+
+    debug_log(
+        "direction_mapping:append "
+        f"observed={len(observed)} missing={len(missing_entries)} added={added_count} error={bool(write_error)}"
+    )
+
+
 def build_db_timetables_headers() -> dict[str, str]:
     headers = {
         "User-Agent": USER_AGENT,
@@ -234,11 +463,13 @@ class Departure:
     in_min: int
     delay_s: Optional[int]
     trip_id: str
+    direction_label: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
             "route": self.route,
             "direction": self.direction,
+            "direction_label": self.direction_label,
             "platform": self.platform,
             "stop_id": self.stop_id,
             "time_epoch": self.time_epoch,
@@ -254,6 +485,8 @@ class StaticFallbackIndex:
     stop_entries: dict[str, list[tuple[str, int]]]
     trip_route: dict[str, str]
     trip_direction: dict[str, str]
+    event_direction: dict[tuple[str, int, str], str]
+    target_stop_name: dict[str, str]
     trip_service: dict[str, str]
     service_weekdays: dict[str, tuple[int, int, int, int, int, int, int]]
     service_date_range: dict[str, tuple[date, date]]
@@ -277,6 +510,14 @@ class RuntimeState:
     static_fallback_index: Optional[StaticFallbackIndex] = None
     static_fallback_error: Optional[str] = None
     next_static_fallback_reload_monotonic: float = 0.0
+    direction_labels: dict[tuple[str, str], str] = field(default_factory=dict)
+    direction_label_patterns: list[tuple[str, str, str]] = field(default_factory=list)
+    known_direction_keys: set[tuple[str, str]] = field(default_factory=set)
+    direction_mapping_error: Optional[str] = None
+    next_direction_mapping_reload_monotonic: float = 0.0
+    extended_departures_cache: dict[str, tuple[float, list[Departure], list[str], Optional[int]]] = field(
+        default_factory=dict
+    )
     refresh_task: Optional[asyncio.Task] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -590,7 +831,7 @@ def load_trip_route_map_from_static_gtfs(
 
             if not trip_ids:
                 debug_log("mapping_fallback:no_trips_for_configured_stop_ids")
-                return {}, {}, "mapping fallback: keine Trips fÃ¼r konfigurierte stop_ids gefunden"
+                return {}, {}, "mapping fallback: keine Trips fÃƒÆ’Ã‚Â¼r konfigurierte stop_ids gefunden"
 
             trips_started = time.monotonic()
             trip_to_route_id: dict[str, str] = {}
@@ -1204,6 +1445,8 @@ def load_static_fallback_index_for_stop_ids(
         stop_entries={},
         trip_route={},
         trip_direction={},
+        event_direction={},
+        target_stop_name={},
         trip_service={},
         service_weekdays={},
         service_date_range={},
@@ -1220,8 +1463,9 @@ def load_static_fallback_index_for_stop_ids(
         with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
             stop_entries: dict[str, list[tuple[str, int]]] = {stop_id: [] for stop_id in target_stop_ids}
             relevant_trip_ids: set[str] = set()
-            trip_last_stop_seq: dict[str, int] = {}
-            trip_last_stop_id: dict[str, str] = {}
+            relevant_target_events: list[tuple[str, str, int, Optional[int]]] = []
+            trip_stop_sequences: dict[str, list[tuple[int, str]]] = {}
+            event_sequence_lookup: dict[tuple[str, str, int], int] = {}
 
             stop_times_started = time.monotonic()
             with archive.open("stop_times.txt", "r") as handle:
@@ -1232,6 +1476,14 @@ def load_static_fallback_index_for_stop_ids(
                         continue
 
                     stop_id = str(row.get("stop_id", "")).strip()
+                    sequence_raw = str(row.get("stop_sequence", "")).strip()
+                    sequence: Optional[int] = None
+                    if sequence_raw:
+                        try:
+                            sequence = int(sequence_raw)
+                        except ValueError:
+                            sequence = None
+
                     if stop_id in target_stop_ids:
                         departure_seconds = _parse_gtfs_hms_to_seconds(
                             str(row.get("departure_time", "")).strip() or str(row.get("arrival_time", "")).strip()
@@ -1239,25 +1491,16 @@ def load_static_fallback_index_for_stop_ids(
                         if departure_seconds is not None:
                             stop_entries.setdefault(stop_id, []).append((trip_id, departure_seconds))
                             relevant_trip_ids.add(trip_id)
+                            relevant_target_events.append((trip_id, stop_id, departure_seconds, sequence))
 
-                    # GTFS stop_times ist ueblicherweise nach trip_id/stop_sequence sortiert.
-                    # Sobald ein relevanter Trip bekannt ist, merken wir uns den letzten Halt als Richtungs-Fallback.
-                    if trip_id in relevant_trip_ids and stop_id:
-                        sequence_raw = str(row.get("stop_sequence", "")).strip()
-                        sequence: Optional[int] = None
-                        if sequence_raw:
-                            try:
-                                sequence = int(sequence_raw)
-                            except ValueError:
-                                sequence = None
-
-                        if sequence is None:
-                            trip_last_stop_id[trip_id] = stop_id
-                        else:
-                            current = trip_last_stop_seq.get(trip_id)
-                            if current is None or sequence >= current:
-                                trip_last_stop_seq[trip_id] = sequence
-                                trip_last_stop_id[trip_id] = stop_id
+                    # Collect stop sequence rows once trip became relevant.
+                    if trip_id in relevant_trip_ids and stop_id and sequence is not None:
+                        trip_stop_sequences.setdefault(trip_id, []).append((sequence, stop_id))
+                        sequence_departure_seconds = _parse_gtfs_hms_to_seconds(
+                            str(row.get("departure_time", "")).strip() or str(row.get("arrival_time", "")).strip()
+                        )
+                        if sequence_departure_seconds is not None:
+                            event_sequence_lookup[(trip_id, stop_id, sequence_departure_seconds)] = sequence
             stop_times_elapsed = time.monotonic() - stop_times_started
 
             if not relevant_trip_ids:
@@ -1291,35 +1534,102 @@ def load_static_fallback_index_for_stop_ids(
                         trip_direction[trip_id] = headsign
             trips_elapsed = time.monotonic() - trips_started
 
-            missing_direction_trip_ids = [trip_id for trip_id in relevant_trip_ids if not trip_direction.get(trip_id)]
-            terminal_stop_ids = {
-                trip_last_stop_id.get(trip_id, "") for trip_id in missing_direction_trip_ids if trip_last_stop_id.get(trip_id, "")
+            for trip_id in trip_stop_sequences:
+                trip_stop_sequences[trip_id].sort(key=lambda item: item[0])
+
+            trip_max_sequence: dict[str, int] = {
+                trip_id: sequence_rows[-1][0] for trip_id, sequence_rows in trip_stop_sequences.items() if sequence_rows
             }
-            terminal_stop_names: dict[str, str] = {}
+            filtered_terminal_departures = 0
+            for stop_id in list(stop_entries.keys()):
+                filtered_entries: list[tuple[str, int]] = []
+                for trip_id, departure_seconds in stop_entries.get(stop_id, []):
+                    event_sequence = event_sequence_lookup.get((trip_id, stop_id, departure_seconds))
+                    max_sequence = trip_max_sequence.get(trip_id)
+                    if event_sequence is not None and max_sequence is not None and event_sequence >= max_sequence:
+                        filtered_terminal_departures += 1
+                        continue
+                    filtered_entries.append((trip_id, departure_seconds))
+                stop_entries[stop_id] = filtered_entries
+
+            needed_stop_ids: set[str] = set(target_stop_ids)
+            for sequence_rows in trip_stop_sequences.values():
+                for _, stop_id in sequence_rows:
+                    needed_stop_ids.add(stop_id)
+
+            stop_id_to_name: dict[str, str] = {}
             stops_lookup_elapsed = 0.0
-            derived_directions = 0
-            if terminal_stop_ids:
+            if needed_stop_ids:
                 stops_lookup_started = time.monotonic()
                 try:
                     with archive.open("stops.txt", "r") as handle:
                         reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
                         for row in reader:
                             stop_id = str(row.get("stop_id", "")).strip()
-                            if stop_id not in terminal_stop_ids:
+                            if stop_id not in needed_stop_ids:
                                 continue
                             stop_name = str(row.get("stop_name", "")).strip()
                             if stop_name:
-                                terminal_stop_names[stop_id] = stop_name
+                                stop_id_to_name[stop_id] = stop_name
                 except KeyError:
                     pass
                 stops_lookup_elapsed = time.monotonic() - stops_lookup_started
 
-                for trip_id in missing_direction_trip_ids:
-                    terminal_stop_id = trip_last_stop_id.get(trip_id, "")
-                    direction_name = terminal_stop_names.get(terminal_stop_id, "").strip()
-                    if direction_name:
-                        trip_direction[trip_id] = direction_name
-                        derived_directions += 1
+            derived_terminal_directions = 0
+            for trip_id in relevant_trip_ids:
+                if trip_direction.get(trip_id):
+                    continue
+                sequence_rows = trip_stop_sequences.get(trip_id, [])
+                if not sequence_rows:
+                    continue
+                direction_name = ""
+                for _, stop_id in reversed(sequence_rows):
+                    stop_name = stop_id_to_name.get(stop_id, "").strip()
+                    if stop_name:
+                        direction_name = stop_name
+                        break
+                if direction_name:
+                    trip_direction[trip_id] = direction_name
+                    derived_terminal_directions += 1
+
+            event_direction: dict[tuple[str, int, str], str] = {}
+            derived_event_directions = 0
+            for trip_id, stop_id, departure_seconds, stop_sequence in relevant_target_events:
+                sequence_rows = trip_stop_sequences.get(trip_id, [])
+                if not sequence_rows:
+                    continue
+
+                resolved_sequence = stop_sequence
+                if resolved_sequence is None:
+                    resolved_sequence = event_sequence_lookup.get((trip_id, stop_id, departure_seconds))
+                if resolved_sequence is None:
+                    continue
+
+                current_name = stop_id_to_name.get(stop_id, "").strip().lower()
+                direction_name = ""
+
+                # Prefer the last future stop name different from the current stop name.
+                for sequence_value, sequence_stop_id in sequence_rows:
+                    if sequence_value <= resolved_sequence:
+                        continue
+                    stop_name = stop_id_to_name.get(sequence_stop_id, "").strip()
+                    if not stop_name:
+                        continue
+                    if current_name and stop_name.lower() == current_name:
+                        continue
+                    direction_name = stop_name
+
+                if not direction_name:
+                    for sequence_value, sequence_stop_id in sequence_rows:
+                        if sequence_value <= resolved_sequence:
+                            continue
+                        stop_name = stop_id_to_name.get(sequence_stop_id, "").strip()
+                        if stop_name:
+                            direction_name = stop_name
+
+                if direction_name:
+                    event_direction[(trip_id, departure_seconds, stop_id)] = direction_name
+                    derived_event_directions += 1
 
             route_id_to_short: dict[str, str] = {}
             routes_started = time.monotonic()
@@ -1398,10 +1708,14 @@ def load_static_fallback_index_for_stop_ids(
             for stop_id in stop_entries:
                 stop_entries[stop_id].sort(key=lambda item: item[1])
 
+            target_stop_name = {stop_id: stop_id_to_name.get(stop_id, "").strip() for stop_id in target_stop_ids}
+
             index = StaticFallbackIndex(
                 stop_entries=stop_entries,
                 trip_route=trip_route,
                 trip_direction=trip_direction,
+                event_direction=event_direction,
+                target_stop_name=target_stop_name,
                 trip_service=trip_service,
                 service_weekdays=service_weekdays,
                 service_date_range=service_date_range,
@@ -1413,7 +1727,8 @@ def load_static_fallback_index_for_stop_ids(
                 "fallback_static:index_ready "
                 f"stop_ids={len(target_stop_ids)} entries={total_entries} trips={len(relevant_trip_ids)} "
                 f"with_routes={len(trip_route)} with_service={len(trip_service)} "
-                f"with_direction={len(trip_direction)} direction_from_terminal={derived_directions} "
+                f"with_direction={len(trip_direction)} terminal_direction={derived_terminal_directions} "
+                f"event_direction={len(event_direction)} derived_event_direction={derived_event_directions} filtered_terminal={filtered_terminal_departures} "
                 f"stop_times_s={stop_times_elapsed:.2f} trips_s={trips_elapsed:.2f} routes_s={routes_elapsed:.2f} "
                 f"stops_lookup_s={stops_lookup_elapsed:.2f} calendar_s={calendar_elapsed:.2f} "
                 f"calendar_dates_s={calendar_dates_elapsed:.2f} total_s={time.monotonic() - started_at:.2f}"
@@ -1422,6 +1737,7 @@ def load_static_fallback_index_for_stop_ids(
     except Exception as exc:
         debug_log(f"fallback_static:index_failed error={exc}")
         return None, f"static fallback parse failed: {exc}"
+
 
 
 def _service_runs_on_date(index: StaticFallbackIndex, service_id: str, service_date: date) -> bool:
@@ -1479,7 +1795,10 @@ def extract_static_schedule_departures(
     for stop_id in stop_ids:
         for trip_id, departure_seconds in index.stop_entries.get(stop_id, []):
             route = index.trip_route.get(trip_id, "")
-            direction = index.trip_direction.get(trip_id, "")
+            direction = index.event_direction.get((trip_id, departure_seconds, stop_id), index.trip_direction.get(trip_id, ""))
+            source_stop_name = index.target_stop_name.get(stop_id, "").strip()
+            if source_stop_name and direction and direction.strip().lower() == source_stop_name.lower():
+                direction = ""
 
             if route_filter:
                 if not route:
@@ -1531,15 +1850,76 @@ def merge_departures_realtime_with_fallback(
     fallback_departures: list[Departure],
     max_departures: int,
 ) -> list[Departure]:
-    merged: list[Departure] = list(realtime_departures)
-    seen_keys = {(dep.trip_id, dep.time_epoch, dep.stop_id) for dep in merged}
+    def canonical_trip_id(value: str) -> str:
+        trip_id = str(value or "").strip().casefold()
+        if not trip_id:
+            return ""
+        # tolerate common suffix variants from different sources (e.g. date/realtime suffixes)
+        trip_id = re.sub(r"([_#-])(rt|realtime)$", "", trip_id)
+        trip_id = re.sub(r"([_#-])\d{8,}$", "", trip_id)
+        return trip_id
 
-    for dep in fallback_departures:
-        dedup_key = (dep.trip_id, dep.time_epoch, dep.stop_id)
-        if dedup_key in seen_keys:
+    def route_direction_stop_key(dep: Departure) -> tuple[str, str, str]:
+        route = re.sub(r"\s+", " ", str(dep.route or "").strip()).casefold()
+        direction = re.sub(r"\s+", " ", str(dep.direction or "").strip()).casefold()
+        stop_id = str(dep.stop_id or "").strip()
+        return route, direction, stop_id
+
+    merged: list[Departure] = []
+    seen_exact: set[tuple[str, int, str, str]] = set()
+    realtime_trip_stop_keys: set[tuple[str, str]] = set()
+    realtime_planned_by_rds: dict[tuple[str, str, str], list[int]] = {}
+    realtime_actual_by_rds: dict[tuple[str, str, str], list[int]] = {}
+
+    for dep in sorted(realtime_departures, key=lambda item: item.time_epoch):
+        exact_key = (dep.trip_id, dep.time_epoch, dep.stop_id, dep.route)
+        if exact_key in seen_exact:
             continue
-        seen_keys.add(dedup_key)
+        seen_exact.add(exact_key)
         merged.append(dep)
+
+        stop_id = str(dep.stop_id or "").strip()
+        if stop_id:
+            trip_id = str(dep.trip_id or "").strip()
+            if trip_id:
+                realtime_trip_stop_keys.add((trip_id, stop_id))
+                canonical = canonical_trip_id(trip_id)
+                if canonical and canonical != trip_id.casefold():
+                    realtime_trip_stop_keys.add((canonical, stop_id))
+
+        rds_key = route_direction_stop_key(dep)
+        realtime_actual_by_rds.setdefault(rds_key, []).append(dep.time_epoch)
+        if dep.delay_s is not None:
+            planned_epoch = dep.time_epoch - dep.delay_s
+            realtime_planned_by_rds.setdefault(rds_key, []).append(planned_epoch)
+
+    for dep in sorted(fallback_departures, key=lambda item: item.time_epoch):
+        stop_id = str(dep.stop_id or "").strip()
+        trip_id = str(dep.trip_id or "").strip()
+        if trip_id and stop_id:
+            if (trip_id, stop_id) in realtime_trip_stop_keys:
+                continue
+            canonical = canonical_trip_id(trip_id)
+            if canonical and (canonical, stop_id) in realtime_trip_stop_keys:
+                continue
+
+        rds_key = route_direction_stop_key(dep)
+        # Prefer realtime if the same service is already present with delay-shifted time.
+        planned_candidates = realtime_planned_by_rds.get(rds_key, [])
+        if planned_candidates and any(abs(dep.time_epoch - candidate) <= 120 for candidate in planned_candidates):
+            continue
+        # Fallback safety net for cases without delay info in realtime.
+        actual_candidates = realtime_actual_by_rds.get(rds_key, [])
+        if actual_candidates and any(abs(dep.time_epoch - candidate) <= 60 for candidate in actual_candidates):
+            continue
+
+        exact_key = (dep.trip_id, dep.time_epoch, dep.stop_id, dep.route)
+        if exact_key in seen_exact:
+            continue
+        seen_exact.add(exact_key)
+        merged.append(dep)
+        if len(merged) >= max_departures:
+            break
 
     merged.sort(key=lambda item: item.time_epoch)
     return merged[: max_departures]
@@ -1724,6 +2104,7 @@ async def poll_once(state: RuntimeState) -> None:
         async with state.lock:
             state.errors_by_widget = {}
             state.departures_by_widget = {}
+            state.extended_departures_cache = {}
             state.next_refresh_due_monotonic = time.monotonic() + state.config.feed.refresh_seconds
         debug_log("poll_once:widgets_empty")
         return
@@ -1731,6 +2112,15 @@ async def poll_once(state: RuntimeState) -> None:
     now_epoch = int(time.time())
     gtfs_widgets = [widget for widget in state.config.widgets if widget.source == "gtfs_rt"]
     db_widgets = [widget for widget in state.config.widgets if widget.source == "db_iris"]
+
+    await refresh_direction_mapping_if_due(state)
+    async with state.lock:
+        direction_labels = dict(state.direction_labels)
+        direction_label_patterns = list(state.direction_label_patterns)
+        direction_label_patterns = list(state.direction_label_patterns)
+        direction_label_patterns = list(state.direction_label_patterns)
+
+    observed_direction_entries: dict[tuple[str, str], tuple[str, str]] = {}
 
     route_map: dict[str, str] = {}
     trip_destination_map: dict[str, str] = {}
@@ -1836,13 +2226,13 @@ async def poll_once(state: RuntimeState) -> None:
                 if mapping_error:
                     widget_errors.append(mapping_error)
                 if not widget.stop_ids:
-                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer mÃ¶glich.")
+                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer mÃƒÆ’Ã‚Â¶glich.")
                 if widget.route_short_names and not route_map:
                     widget_errors.append(
-                        f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfÃ¼gbar."
+                        f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfÃƒÆ’Ã‚Â¼gbar."
                     )
                 if not known_stop_ids and known_stop_ids_error:
-                    widget_errors.append(f"Stop-ID-Validierung aktuell nicht verfÃ¼gbar: {known_stop_ids_error}")
+                    widget_errors.append(f"Stop-ID-Validierung aktuell nicht verfÃƒÆ’Ã‚Â¼gbar: {known_stop_ids_error}")
                 for stop_id in widget.stop_ids:
                     if known_stop_ids and stop_id not in known_stop_ids:
                         widget_errors.append(f"Falsche Konfiguration: Stop-ID {stop_id} nicht gefunden.")
@@ -1871,8 +2261,9 @@ async def poll_once(state: RuntimeState) -> None:
                             f"merged={len(departures)}"
                         )
                     elif static_fallback_error and realtime_count == 0:
-                        widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfÃ¼gbar: {static_fallback_error}")
+                        widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfÃƒÆ’Ã‚Â¼gbar: {static_fallback_error}")
 
+                observed_direction_entries.update(apply_direction_labels(departures, direction_labels, direction_label_patterns))
                 departures_by_widget[widget.id] = departures
                 total_departures += len(departures)
                 debug_log(
@@ -1892,6 +2283,7 @@ async def poll_once(state: RuntimeState) -> None:
             continue
         try:
             departures = await fetch_db_iris_departures(widget, state.config.feed.http_timeout_seconds, now_epoch)
+            observed_direction_entries.update(apply_direction_labels(departures, direction_labels, direction_label_patterns))
             departures_by_widget[widget.id] = departures
             total_departures += len(departures)
             debug_log(
@@ -1902,10 +2294,13 @@ async def poll_once(state: RuntimeState) -> None:
             errors_by_widget[widget.id].append(f"DB-IRIS Abruf fehlgeschlagen: {exc}")
             debug_log(f"poll_once:db_iris_error widget={widget.id} error={exc}")
 
+    await register_observed_direction_entries(state, observed_direction_entries)
+
     async with state.lock:
         state.departures_by_widget = departures_by_widget
         state.fetched_at_epoch = now_epoch
         state.errors_by_widget = errors_by_widget
+        state.extended_departures_cache = {}
         state.next_refresh_due_monotonic = time.monotonic() + state.config.feed.refresh_seconds
     debug_log(
         "poll_once:ok "
@@ -1915,29 +2310,164 @@ async def poll_once(state: RuntimeState) -> None:
 
 async def ensure_data_fresh(state: RuntimeState, force: bool = False) -> None:
     task: Optional[asyncio.Task] = None
+    should_wait = False
 
     async with state.lock:
         now_monotonic = time.monotonic()
-        is_stale = state.fetched_at_epoch is None or now_monotonic >= state.next_refresh_due_monotonic
+        has_cached_data = state.fetched_at_epoch is not None
+        is_stale = not has_cached_data or now_monotonic >= state.next_refresh_due_monotonic
+
+        if state.refresh_task and state.refresh_task.done():
+            state.refresh_task = None
+
         if not force and not is_stale:
             debug_log("ensure_data_fresh:cache_hit")
             return
 
         if state.refresh_task and not state.refresh_task.done():
             task = state.refresh_task
-            debug_log("ensure_data_fresh:await_existing_refresh_task")
+            should_wait = force or not has_cached_data
+            if should_wait:
+                debug_log("ensure_data_fresh:await_existing_refresh_task")
+            else:
+                debug_log("ensure_data_fresh:serve_stale_while_refreshing")
         else:
             task = asyncio.create_task(poll_once(state))
             state.refresh_task = task
-            debug_log("ensure_data_fresh:start_new_refresh_task")
+            should_wait = force or not has_cached_data
+            if should_wait:
+                debug_log("ensure_data_fresh:start_new_refresh_task_wait")
+            else:
+                debug_log("ensure_data_fresh:start_new_refresh_task_background")
 
-    if task:
+    if task and should_wait:
         try:
             await task
         finally:
             async with state.lock:
                 if state.refresh_task is task and task.done():
                     state.refresh_task = None
+def _build_24h_widget(widget: WidgetConfig) -> WidgetConfig:
+    max_departures_24h = max(widget.max_departures, 4096)
+    return replace(
+        widget,
+        gtfs_lookahead_hours=24,
+        db_lookahead_hours=24,
+        max_departures=max_departures_24h,
+    )
+
+
+async def get_widget_departures_for_view(
+    state: RuntimeState,
+    widget: WidgetConfig,
+    view_mode: str = "default",
+) -> tuple[list[Departure], Optional[int], list[str]]:
+    normalized_mode = (view_mode or "").strip().lower()
+
+    await ensure_data_fresh(state)
+    await refresh_direction_mapping_if_due(state)
+
+    async with state.lock:
+        direction_labels = dict(state.direction_labels)
+        direction_label_patterns = list(state.direction_label_patterns)
+
+    if normalized_mode != "24h":
+        async with state.lock:
+            departures = list(state.departures_by_widget.get(widget.id, []))
+            fetched_at_epoch = state.fetched_at_epoch
+            errors = list(state.errors_by_widget.get(widget.id, []))
+        observed = apply_direction_labels(departures, direction_labels, direction_label_patterns)
+        await register_observed_direction_entries(state, observed)
+        return departures, fetched_at_epoch, errors
+
+    cache_key = f"{widget.id}:{normalized_mode}"
+    now_monotonic = time.monotonic()
+    cache_hit_payload: Optional[tuple[list[Departure], list[str], Optional[int]]] = None
+
+    async with state.lock:
+        cached_entry = state.extended_departures_cache.get(cache_key)
+        if cached_entry and now_monotonic < cached_entry[0]:
+            _expires_monotonic, cached_departures, cached_errors, cached_fetched_at = cached_entry
+            cache_hit_payload = ([replace(dep) for dep in cached_departures], list(cached_errors), cached_fetched_at)
+
+    if cache_hit_payload is not None:
+        departures, cached_errors, cached_fetched_at = cache_hit_payload
+        observed = apply_direction_labels(departures, direction_labels, direction_label_patterns)
+        await register_observed_direction_entries(state, observed)
+        debug_log(
+            "view_cache:hit "
+            f"widget={widget.id} mode={normalized_mode} departures={len(departures)}"
+        )
+        return departures, cached_fetched_at, cached_errors
+
+    now_epoch = int(time.time())
+    departures: list[Departure] = []
+    errors: list[str] = []
+    fetched_at_epoch: Optional[int] = None
+
+    if widget.source == "gtfs_rt":
+        await refresh_static_fallback_index_if_due(state)
+        async with state.lock:
+            realtime_departures = list(state.departures_by_widget.get(widget.id, []))
+            errors = list(state.errors_by_widget.get(widget.id, []))
+            static_fallback_index = state.static_fallback_index
+            static_fallback_error = state.static_fallback_error
+            fetched_at_epoch = state.fetched_at_epoch
+
+        if static_fallback_index is not None:
+            widget_24h = _build_24h_widget(widget)
+            fallback_departures = extract_static_schedule_departures(widget_24h, static_fallback_index, now_epoch)
+            merged_limit = max(widget_24h.max_departures, len(realtime_departures) + len(fallback_departures))
+            departures = merge_departures_realtime_with_fallback(
+                realtime_departures,
+                fallback_departures,
+                merged_limit,
+            )
+        else:
+            departures = realtime_departures
+            if static_fallback_error:
+                errors.append(
+                    "24h-Ansicht: Statischer Fahrplan-Fallback nicht verf?gbar: "
+                    f"{static_fallback_error}"
+                )
+
+        max_time_epoch = now_epoch + 24 * 3600
+        departures = [dep for dep in departures if now_epoch <= dep.time_epoch <= max_time_epoch]
+        departures.sort(key=lambda item: item.time_epoch)
+    else:
+        widget_24h = _build_24h_widget(widget)
+        try:
+            departures = await fetch_db_iris_departures(widget_24h, state.config.feed.http_timeout_seconds, now_epoch)
+            max_time_epoch = now_epoch + 24 * 3600
+            departures = [dep for dep in departures if now_epoch <= dep.time_epoch <= max_time_epoch]
+            departures.sort(key=lambda item: item.time_epoch)
+            fetched_at_epoch = int(time.time())
+            async with state.lock:
+                errors = list(state.errors_by_widget.get(widget.id, []))
+        except Exception as exc:
+            async with state.lock:
+                departures = list(state.departures_by_widget.get(widget.id, []))
+                fetched_at_epoch = state.fetched_at_epoch
+                errors = list(state.errors_by_widget.get(widget.id, []))
+            errors.append(f"24h-Abfrage fehlgeschlagen: {exc}")
+
+    observed = apply_direction_labels(departures, direction_labels, direction_label_patterns)
+    await register_observed_direction_entries(state, observed)
+
+    cache_ttl_s = max(10, state.config.feed.refresh_seconds)
+    expires_monotonic = time.monotonic() + cache_ttl_s
+    async with state.lock:
+        state.extended_departures_cache[cache_key] = (
+            expires_monotonic,
+            [replace(dep) for dep in departures],
+            list(errors),
+            fetched_at_epoch,
+        )
+    debug_log(
+        "view_cache:store "
+        f"widget={widget.id} mode={normalized_mode} departures={len(departures)} ttl_s={cache_ttl_s}"
+    )
+    return departures, fetched_at_epoch, errors
 
 
 async def refresh_known_stop_ids_if_due(state: RuntimeState, force: bool = False) -> None:
@@ -2061,9 +2591,12 @@ def _format_delay(delay_s: Optional[int]) -> str:
     return f"{sign}{delay_min} min"
 
 
-def _format_direction_with_platform(direction: str, platform: Optional[str]) -> str:
+def _format_direction_with_platform(direction: str, platform: Optional[str], direction_label: Optional[str] = None) -> str:
     direction_text = (direction or "").strip() or "-"
+    custom_label = (direction_label or "").strip()
     platform_text = (platform or "").strip()
+    if custom_label:
+        direction_text = f"{direction_text} ({custom_label})"
     if not platform_text:
         return direction_text
     return f"{direction_text} (Gleis: {platform_text})"
@@ -2100,7 +2633,7 @@ def render_widget_html(
         route = html.escape(dep.route or "-")
         in_label = _format_in_label(dep.in_min)
         time_epoch_attr = html.escape(str(dep.time_epoch))
-        direction = html.escape(_format_direction_with_platform(dep.direction, dep.platform))
+        direction = html.escape(_format_direction_with_platform(dep.direction, dep.platform, dep.direction_label))
         delay_label = _format_delay(dep.delay_s) if widget.show_delay else ""
         delay_class = "delay positive-delay" if widget.show_delay and dep.delay_s is not None and dep.delay_s > 0 else "delay"
         rows.append(
@@ -2119,7 +2652,7 @@ def render_widget_html(
         error_text = " | ".join(html.escape(error) for error in errors)
         rows.append(f"<tr><td colspan='5'>{error_text}</td></tr>")
     elif not rows:
-        rows.append("<tr><td colspan='5'>Keine Abfahrten verfÃ¼gbar.</td></tr>")
+        rows.append("<tr><td colspan='5'>Keine Abfahrten verfÃƒÆ’Ã‚Â¼gbar.</td></tr>")
 
     rows_html = "".join(rows)
     meta_block = ""
@@ -2256,9 +2789,13 @@ def render_widget_html(
       return `${{sign}}${{delayMinutes}} min`;
     }}
 
-    function formatDirection(directionValue, platformValue) {{
-      const directionText = String(directionValue || "").trim() || "-";
+    function formatDirection(directionValue, platformValue, customLabelValue) {{
+      let directionText = String(directionValue || "").trim() || "-";
+      const customLabelText = String(customLabelValue || "").trim();
       const platformText = String(platformValue || "").trim();
+      if (customLabelText) {{
+        directionText = `${{directionText}} (${{customLabelText}})`;
+      }}
       if (!platformText) {{
         return directionText;
       }}
@@ -2307,7 +2844,7 @@ def render_widget_html(
       if (departures.length > 0) {{
         body.innerHTML = departures.map((dep) => {{
           const route = dep.route ? escapeHtml(dep.route) : "-";
-          const direction = escapeHtml(formatDirection(dep.direction, dep.platform));
+          const direction = escapeHtml(formatDirection(dep.direction, dep.platform, dep.direction_label));
           const timeLocal = escapeHtml(dep.time_local || "");
           const timeEpoch = Number(dep.time_epoch || 0);
           const inMin = timeEpoch > 0
@@ -2327,7 +2864,7 @@ def render_widget_html(
         return;
       }}
 
-      body.innerHTML = "<tr><td colspan='5'>Keine Abfahrten verfÃ¼gbar.</td></tr>";
+      body.innerHTML = "<tr><td colspan='5'>Keine Abfahrten verfÃƒÆ’Ã‚Â¼gbar.</td></tr>";
     }}
 
     function renderMeta() {{
@@ -2389,7 +2926,9 @@ def render_widget_index_html(config: AppConfig, base_url: str) -> str:
     root = base_url.rstrip("/")
     for widget in config.widgets:
         widget_url = f"{root}/widget/{widget.id}"
+        widget_24h_url = f"{root}/widget/{widget.id}/24h"
         json_url = f"{root}/json/{widget.id}"
+        json_24h_url = f"{root}/json/{widget.id}/24h"
         stop_ids = ", ".join(widget.stop_ids) if widget.stop_ids else "-"
         source_label = widget.source
         if widget.source == "db_iris" and widget.db_eva_no:
@@ -2399,19 +2938,18 @@ def render_widget_index_html(config: AppConfig, base_url: str) -> str:
             f"<td>{html.escape(widget.id)}</td>"
             f"<td>{html.escape(widget.title)}</td>"
             f"<td>{html.escape(source_label)}</td>"
-            f"<td><a href='{html.escape(widget_url)}'>{html.escape(widget_url)}</a></td>"
-            f"<td><a href='{html.escape(json_url)}'>{html.escape(json_url)}</a></td>"
+            f"<td><a href='{html.escape(widget_url)}'>{html.escape(widget_url)}</a><br/><a href='{html.escape(widget_24h_url)}'>{html.escape(widget_24h_url)}</a></td>"
+            f"<td><a href='{html.escape(json_url)}'>{html.escape(json_url)}</a><br/><a href='{html.escape(json_24h_url)}'>{html.escape(json_24h_url)}</a></td>"
             f"<td>{html.escape(stop_ids)}</td>"
             "</tr>"
         )
-
     table_rows = "".join(rows) if rows else "<tr><td colspan='6'>Keine Widgets konfiguriert.</td></tr>"
     return f"""<!doctype html>
 <html lang="de">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Widget-Ãœbersicht</title>
+  <title>Widget-\u00dcbersicht</title>
   <style>
     body {{ font-family: "Segoe UI", Tahoma, sans-serif; margin: 16px; background: #f5f7fb; color: #1f2937; }}
     table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d1d5db; border-radius: 8px; overflow: hidden; }}
@@ -2421,8 +2959,8 @@ def render_widget_index_html(config: AppConfig, base_url: str) -> str:
   </style>
 </head>
 <body>
-  <h2>VerfÃ¼gbare Widgets</h2>
-  <p>Direkter Aufruf je Widget-ID: <code>/widget/&lt;id&gt;</code></p>
+  <h2>Verf\u00fcgbare Widgets</h2>
+  <p>Direkter Aufruf je Widget-ID: <code>/widget/&lt;id&gt;</code> | 24h-Ansicht: <code>/widget/&lt;id&gt;/24h</code></p>
   <table>
     <thead>
       <tr><th>ID</th><th>Titel</th><th>Quelle</th><th>Widget-URL</th><th>JSON-URL</th><th>Stop-IDs</th></tr>
@@ -2432,7 +2970,6 @@ def render_widget_index_html(config: AppConfig, base_url: str) -> str:
 </body>
 </html>
 """
-
 
 def build_config_excerpt(config: AppConfig) -> dict:
     return {
@@ -2489,41 +3026,47 @@ def create_app(config: AppConfig) -> FastAPI:
     @app.get("/widget", response_class=HTMLResponse)
     async def get_widget_overview(request: Request) -> HTMLResponse:
         return HTMLResponse(render_widget_index_html(config, str(request.base_url)))
-
+    async def _build_json_payload(widget: WidgetConfig, view_mode: str) -> dict:
+        departures, fetched_at_epoch, errors = await get_widget_departures_for_view(state, widget, view_mode)
+        return {
+            "widget_id": widget.id,
+            "widget_title": widget.title,
+            "view_mode": view_mode,
+            "fetched_at": fetched_at_epoch,
+            "age_s": age_seconds(fetched_at_epoch),
+            "departures": [dep.to_dict() for dep in departures],
+            "errors": errors,
+            "widgets": [{"id": w.id, "title": w.title} for w in config.widgets],
+            "config": build_config_excerpt(config),
+        }
     @app.get("/widget/{widget_id}", response_class=HTMLResponse)
     async def get_widget(widget_id: str) -> HTMLResponse:
         widget = find_widget(config, widget_id)
         if widget is None:
             raise HTTPException(status_code=404, detail=f"Widget-ID {widget_id} nicht gefunden.")
-        await ensure_data_fresh(state)
-        async with state.lock:
-            departures = list(state.departures_by_widget.get(widget.id, []))
-            fetched_at_epoch = state.fetched_at_epoch
-            errors = list(state.errors_by_widget.get(widget.id, []))
+        departures, fetched_at_epoch, errors = await get_widget_departures_for_view(state, widget, "default")
         return HTMLResponse(render_widget_html(widget, departures, fetched_at_epoch, f"/json/{widget.id}", errors))
-
+    @app.get("/widget/{widget_id}/24h", response_class=HTMLResponse)
+    async def get_widget_24h(widget_id: str) -> HTMLResponse:
+        widget = find_widget(config, widget_id)
+        if widget is None:
+            raise HTTPException(status_code=404, detail=f"Widget-ID {widget_id} nicht gefunden.")
+        departures, fetched_at_epoch, errors = await get_widget_departures_for_view(state, widget, "24h")
+        return HTMLResponse(render_widget_html(widget, departures, fetched_at_epoch, f"/json/{widget.id}/24h", errors))
     @app.get("/json/{widget_id}", response_class=JSONResponse)
     async def get_json(widget_id: str) -> JSONResponse:
         widget = find_widget(config, widget_id)
         if widget is None:
             raise HTTPException(status_code=404, detail=f"Widget-ID {widget_id} nicht gefunden.")
-        await ensure_data_fresh(state)
-        async with state.lock:
-            departures = [dep.to_dict() for dep in state.departures_by_widget.get(widget.id, [])]
-            fetched_at_epoch = state.fetched_at_epoch
-            errors = list(state.errors_by_widget.get(widget.id, []))
-        payload = {
-            "widget_id": widget.id,
-            "widget_title": widget.title,
-            "fetched_at": fetched_at_epoch,
-            "age_s": age_seconds(fetched_at_epoch),
-            "departures": departures,
-            "errors": errors,
-            "widgets": [{"id": w.id, "title": w.title} for w in config.widgets],
-            "config": build_config_excerpt(config),
-        }
+        payload = await _build_json_payload(widget, "default")
         return JSONResponse(payload)
-
+    @app.get("/json/{widget_id}/24h", response_class=JSONResponse)
+    async def get_json_24h(widget_id: str) -> JSONResponse:
+        widget = find_widget(config, widget_id)
+        if widget is None:
+            raise HTTPException(status_code=404, detail=f"Widget-ID {widget_id} nicht gefunden.")
+        payload = await _build_json_payload(widget, "24h")
+        return JSONResponse(payload)
     @app.get("/health", response_class=JSONResponse)
     async def get_health() -> JSONResponse:
         async with state.lock:
@@ -2578,3 +3121,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
