@@ -1,4 +1,4 @@
-services:
+﻿services:
   timetable-widget:
     build: .
     container_name: timetable-widget
@@ -9,7 +9,7 @@ services:
       - /volume1/docker/timetable-widget-mount/logs:/logs
     environment:
       - CONFIG_PATH=${CONFIG_PATH:-/config/config.yaml}
-      - FALLBACK_CONFIG_PATH=${FALLBACK_CONFIG_PATH:-/app/config.example.yaml}
+      - FALLBACK_CONFIG_PATH=${FALLBACK_CONFIG_PATH:-/app/config/config.yaml.example}
       - DEBUG_MODE=${DEBUG_MODE:-0}
       - DEBUG_LOG_PATH=${DEBUG_LOG_PATH:-/logs/logfile.txt}
       - LOG_INSTANCE_IP=${LOG_INSTANCE_IP:-}
@@ -26,4 +26,5 @@ services:
       # Wenn server.port in der YAML geaendert wird, muss dieses Mapping angepasst werden.
       # Empfehlung: intern bei 8000 bleiben und nur den externen Port anpassen.
       - "8000:8000"
+
 

@@ -1,13 +1,11 @@
-__pycache__/
+﻿__pycache__/
 *.pyc
 .venv/
 data/*.csv
 logs/logfile.txt
-config.yaml
 .env
 .codex/
 temp_backups/
 
 config/direction_overrides.txt
 config/config.yaml
-

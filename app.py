@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import csv
@@ -30,7 +30,7 @@ from google.transit import gtfs_realtime_pb2
 
 
 CONFIG_PATH = os.getenv("CONFIG_PATH", "/config/config.yaml")
-FALLBACK_CONFIG_PATH = os.getenv("FALLBACK_CONFIG_PATH", "/app/config.example.yaml")
+FALLBACK_CONFIG_PATH = os.getenv("FALLBACK_CONFIG_PATH", "/app/config/config.yaml.example")
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -528,7 +528,7 @@ def load_yaml(path: str) -> dict:
         candidates = [
             target / "config.yaml",
             target / "config.yml",
-            target / "config.example.yaml",
+            target / "config.yaml.example",
             Path(FALLBACK_CONFIG_PATH),
         ]
         replacement = next((candidate for candidate in candidates if candidate.is_file()), None)
@@ -831,7 +831,7 @@ def load_trip_route_map_from_static_gtfs(
 
             if not trip_ids:
                 debug_log("mapping_fallback:no_trips_for_configured_stop_ids")
-                return {}, {}, "mapping fallback: keine Trips fÃƒÆ’Ã‚Â¼r konfigurierte stop_ids gefunden"
+                return {}, {}, "mapping fallback: keine Trips fÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼r konfigurierte stop_ids gefunden"
 
             trips_started = time.monotonic()
             trip_to_route_id: dict[str, str] = {}
@@ -2226,13 +2226,13 @@ async def poll_once(state: RuntimeState) -> None:
                 if mapping_error:
                     widget_errors.append(mapping_error)
                 if not widget.stop_ids:
-                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer mÃƒÆ’Ã‚Â¶glich.")
+                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer mÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¶glich.")
                 if widget.route_short_names and not route_map:
                     widget_errors.append(
-                        f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfÃƒÆ’Ã‚Â¼gbar."
+                        f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar."
                     )
                 if not known_stop_ids and known_stop_ids_error:
-                    widget_errors.append(f"Stop-ID-Validierung aktuell nicht verfÃƒÆ’Ã‚Â¼gbar: {known_stop_ids_error}")
+                    widget_errors.append(f"Stop-ID-Validierung aktuell nicht verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar: {known_stop_ids_error}")
                 for stop_id in widget.stop_ids:
                     if known_stop_ids and stop_id not in known_stop_ids:
                         widget_errors.append(f"Falsche Konfiguration: Stop-ID {stop_id} nicht gefunden.")
@@ -2261,7 +2261,7 @@ async def poll_once(state: RuntimeState) -> None:
                             f"merged={len(departures)}"
                         )
                     elif static_fallback_error and realtime_count == 0:
-                        widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfÃƒÆ’Ã‚Â¼gbar: {static_fallback_error}")
+                        widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar: {static_fallback_error}")
 
                 observed_direction_entries.update(apply_direction_labels(departures, direction_labels, direction_label_patterns))
                 departures_by_widget[widget.id] = departures
@@ -2652,7 +2652,7 @@ def render_widget_html(
         error_text = " | ".join(html.escape(error) for error in errors)
         rows.append(f"<tr><td colspan='5'>{error_text}</td></tr>")
     elif not rows:
-        rows.append("<tr><td colspan='5'>Keine Abfahrten verfÃƒÆ’Ã‚Â¼gbar.</td></tr>")
+        rows.append("<tr><td colspan='5'>Keine Abfahrten verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar.</td></tr>")
 
     rows_html = "".join(rows)
     meta_block = ""
@@ -2864,7 +2864,7 @@ def render_widget_html(
         return;
       }}
 
-      body.innerHTML = "<tr><td colspan='5'>Keine Abfahrten verfÃƒÆ’Ã‚Â¼gbar.</td></tr>";
+      body.innerHTML = "<tr><td colspan='5'>Keine Abfahrten verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar.</td></tr>";
     }}
 
     function renderMeta() {{
@@ -3121,4 +3121,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

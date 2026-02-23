@@ -2,6 +2,17 @@
 
 Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
 
+## [1.1.1] - 2026-02-23
+
+### Ge?ndert
+- Konfigurationsvorlage vereinheitlicht: nur noch `config/config.yaml.example` wird verwendet.
+- Dockerfile auf non-root-Betrieb (`app`, UID/GID 10001) und OCI-Labels erweitert.
+- Docker-Healthcheck f?r `/health` erg?nzt.
+- Compose-/ENV-Fallback-Pfade auf `config/config.yaml.example` umgestellt.
+
+### Behoben
+- Deduplizierung von Echtzeit- und statischen GTFS-Abfahrten verbessert.
+
 ## [1.1.0] - 2026-02-23
 
 ### Hinzugefügt
