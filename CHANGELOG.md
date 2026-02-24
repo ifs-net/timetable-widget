@@ -2,6 +2,15 @@
 
 Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
 
+## [1.3.4] - 2026-02-24
+
+### Ge?ndert
+- Statischer GTFS-Fallback wird bei Bedarf asynchron im Hintergrund aktualisiert, damit Requests bei der Initialisierung nicht unn?tig blockieren.
+- Polling-Enrichment verarbeitet nur noch fehlende Trip-IDs statt pauschal aller relevanten Trips.
+- 24h-Ansicht und GTFS-Widget melden klar, wenn der statische Fahrplan-Fallback noch initialisiert wird.
+- Versp?tungsanzeige vereinheitlicht: > 0 Minuten rot, 0 Minuten neutral, < 0 Minuten gr?n (inklusive konsistenter Rundung).
+- Mehrere fehlerhafte Mojibake-Texte im Python-Code korrigiert.
+
 ## [1.3.3] - 2026-02-24
 
 ### Hinzugefuegt

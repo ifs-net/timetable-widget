@@ -9,10 +9,20 @@ TimeFn = Callable[[int], Any]
 AgeFn = Callable[[Optional[int]], Optional[int]]
 
 
-def _format_delay(delay_s: Optional[int]) -> str:
+def _delay_minutes_for_display(delay_s: Optional[int]) -> Optional[int]:
     if delay_s is None:
+        return None
+    if delay_s > 0:
+        return max(1, int((delay_s + 59) // 60))
+    if delay_s < 0:
+        return -max(1, int((abs(delay_s) + 59) // 60))
+    return 0
+
+
+def _format_delay(delay_s: Optional[int]) -> str:
+    delay_min = _delay_minutes_for_display(delay_s)
+    if delay_min is None:
         return ""
-    delay_min = int(round(delay_s / 60))
     sign = "+" if delay_min > 0 else ""
     return f"{sign}{delay_min} min"
 
@@ -185,7 +195,13 @@ def render_widget_html(
         time_epoch_attr = html.escape(str(dep.time_epoch))
         direction = html.escape(_format_direction_with_platform(dep.direction, dep.platform, dep.direction_label))
         delay_label = _format_delay(dep.delay_s) if widget.show_delay else ""
-        delay_class = "delay positive-delay" if widget.show_delay and dep.delay_s is not None and dep.delay_s > 0 else "delay"
+        delay_class = "delay"
+        if widget.show_delay:
+            delay_min = _delay_minutes_for_display(dep.delay_s)
+            if delay_min is not None and delay_min > 0:
+                delay_class = "delay positive-delay"
+            elif delay_min is not None and delay_min < 0:
+                delay_class = "delay negative-delay"
         rows.append(
             (
                 "<tr>"
@@ -286,6 +302,10 @@ def render_widget_html(
       color: #b91c1c;
       font-weight: 700;
     }}
+    td.negative-delay {{
+      color: #15803d;
+      font-weight: 700;
+    }}
     .meta {{
       font-size: 12px;
       color: var(--muted);
@@ -328,11 +348,28 @@ def render_widget_html(
         .replace(/'/g, "&#39;");
     }}
 
-    function formatDelay(delaySeconds) {{
+    function delayMinutesForDisplay(delaySeconds) {{
       if (delaySeconds === null || delaySeconds === undefined) {{
+        return null;
+      }}
+      const rawSeconds = Number(delaySeconds);
+      if (!Number.isFinite(rawSeconds)) {{
+        return null;
+      }}
+      if (rawSeconds > 0) {{
+        return Math.max(1, Math.ceil(rawSeconds / 60));
+      }}
+      if (rawSeconds < 0) {{
+        return -Math.max(1, Math.ceil(Math.abs(rawSeconds) / 60));
+      }}
+      return 0;
+    }}
+
+    function formatDelay(delaySeconds) {{
+      const delayMinutes = delayMinutesForDisplay(delaySeconds);
+      if (delayMinutes === null) {{
         return "";
       }}
-      const delayMinutes = Math.round(Number(delaySeconds) / 60);
       const sign = delayMinutes > 0 ? "+" : "";
       return `${{sign}}${{delayMinutes}} min`;
     }}
@@ -401,8 +438,16 @@ def render_widget_html(
             : Math.max(0, Number(dep.in_min || 0));
           const inLabel = formatInLabel(inMin);
           const delaySeconds = dep.delay_s === null || dep.delay_s === undefined ? null : Number(dep.delay_s);
+          const delayMinutes = delayMinutesForDisplay(delaySeconds);
           const delay = showDelay ? escapeHtml(formatDelay(delaySeconds)) : "";
-          const delayClass = showDelay && delaySeconds !== null && delaySeconds > 0 ? "delay positive-delay" : "delay";
+          let delayClass = "delay";
+          if (showDelay && delayMinutes !== null) {{
+            if (delayMinutes > 0) {{
+              delayClass = "delay positive-delay";
+            }} else if (delayMinutes < 0) {{
+              delayClass = "delay negative-delay";
+            }}
+          }}
           return `<tr><td>${{route}}</td><td>${{direction}}</td><td>${{timeLocal}}</td><td class="in-min" data-time-epoch="${{timeEpoch}}">${{escapeHtml(inLabel)}}</td><td class="${{delayClass}}">${{delay}}</td></tr>`;
         }}).join("");
         return;

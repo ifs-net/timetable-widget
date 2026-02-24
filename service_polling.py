@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import time
@@ -112,8 +112,9 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
             relevant_trip_ids, relevant_last_stops = deps.collect_realtime_trip_context(feed_message, configured_stop_ids)
             missing_route_trip_ids = {trip_id for trip_id in relevant_trip_ids if trip_id not in route_map}
             missing_destination_trip_ids = {trip_id for trip_id in relevant_trip_ids if trip_id not in trip_destination_map}
-            cold_start_can_skip_enrich = (not had_cached_data) and (bool(route_map) or bool(trip_destination_map))
-            if missing_route_trip_ids or missing_destination_trip_ids:
+            missing_enrichment_trip_ids = missing_route_trip_ids | missing_destination_trip_ids
+            cold_start_can_skip_enrich = not had_cached_data
+            if missing_enrichment_trip_ids:
                 if cold_start_can_skip_enrich:
                     deps.debug_log(
                         "poll_once:mapping_enrich_skipped_cold_start "
@@ -123,7 +124,7 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
                 else:
                     enrich_route_map, enrich_destination_map, enrich_error = await asyncio.to_thread(
                         deps.load_trip_maps_for_trip_ids_from_static_gtfs,
-                        relevant_trip_ids,
+                        missing_enrichment_trip_ids,
                         relevant_last_stops,
                         max(30, state.config.feed.http_timeout_seconds * 4),
                     )
@@ -208,6 +209,8 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
                             async with state.lock:
                                 static_fallback_index = state.static_fallback_index
                                 static_fallback_error = state.static_fallback_error
+                                static_fallback_task = getattr(state, "static_fallback_refresh_task", None)
+                                static_fallback_loading = bool(static_fallback_task and not static_fallback_task.done())
                             static_fallback_loaded = True
 
                         if static_fallback_index is not None:
@@ -224,6 +227,8 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
                             )
                         elif static_fallback_error and realtime_count == 0:
                             widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfügbar: {static_fallback_error}")
+                        elif realtime_count == 0 and static_fallback_loading:
+                            widget_errors.append("Statischer Fahrplan-Fallback wird initialisiert. Bitte erneut laden.")
 
                 observed_direction_entries.update(
                     deps.apply_direction_labels(departures, direction_labels, direction_label_patterns)
@@ -339,5 +344,3 @@ async def run_startup_warmup(state: Any, deps: PollingDeps) -> None:
         f"has_fetch={has_fetch} departures={departures_count} errors={errors_count} "
         f"duration_s={time.monotonic() - started_at:.2f}"
     )
-
-

@@ -325,8 +325,8 @@ def debug_log(message: str) -> None:
 
 def _normalize_direction_mapping_value(value: str) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
-    # tolerate replacement characters from bad encodings (e.g. Universit?t)
-    text = text.replace("?", "?")
+    # tolerate replacement characters from bad encodings (e.g. Universität)
+    text = text.replace("\ufffd", "?")
     return text
 
 
@@ -335,7 +335,7 @@ def _normalize_direction_mapping_key(route: str, direction: str) -> tuple[str, s
 
 
 def _is_wildcard_pattern(value: str) -> bool:
-    return "?" in value or "*" in value
+    return "\ufffd" in value or "*" in value
 
 
 def _matches_direction_pattern(
@@ -652,6 +652,7 @@ class RuntimeState:
     static_fallback_index: Optional[StaticFallbackIndex] = None
     static_fallback_error: Optional[str] = None
     next_static_fallback_reload_monotonic: float = 0.0
+    static_fallback_refresh_task: Optional[asyncio.Task] = None
     direction_labels: dict[tuple[str, str], str] = field(default_factory=dict)
     direction_label_patterns: list[tuple[str, str, str]] = field(default_factory=list)
     known_direction_keys: set[tuple[str, str]] = field(default_factory=set)
@@ -994,7 +995,7 @@ def load_trip_route_map_from_static_gtfs(
 
             if not trip_ids:
                 debug_log("mapping_fallback:no_trips_for_configured_stop_ids")
-                return {}, {}, "mapping fallback: keine Trips fÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼r konfigurierte stop_ids gefunden"
+                return {}, {}, "mapping fallback: keine Trips für konfigurierte stop_ids gefunden"
 
             trips_started = time.monotonic()
             trip_to_route_id: dict[str, str] = {}
@@ -2166,12 +2167,14 @@ async def get_widget_departures_for_view(
     fetched_at_epoch: Optional[int] = None
 
     if widget.source == "gtfs_rt":
-        await refresh_static_fallback_index_if_due(state)
+        await refresh_static_fallback_index_if_due(state, wait=False)
         async with state.lock:
             realtime_departures = list(state.departures_by_widget.get(widget.id, []))
             errors = list(state.errors_by_widget.get(widget.id, []))
             static_fallback_index = state.static_fallback_index
             static_fallback_error = state.static_fallback_error
+            static_fallback_task = state.static_fallback_refresh_task
+            static_fallback_loading = bool(static_fallback_task and not static_fallback_task.done())
             fetched_at_epoch = state.fetched_at_epoch
 
         if static_fallback_index is not None:
@@ -2187,9 +2190,11 @@ async def get_widget_departures_for_view(
             departures = realtime_departures
             if static_fallback_error:
                 errors.append(
-                    "24h-Ansicht: Statischer Fahrplan-Fallback nicht verf?gbar: "
+                    "24h-Ansicht: Statischer Fahrplan-Fallback nicht verfügbar: "
                     f"{static_fallback_error}"
                 )
+            elif static_fallback_loading:
+                errors.append("24h-Ansicht: Statischer Fahrplan-Fallback wird initialisiert. Bitte erneut laden.")
 
         max_time_epoch = now_epoch + 24 * 3600
         departures = [dep for dep in departures if now_epoch <= dep.time_epoch <= max_time_epoch]
@@ -2257,13 +2262,66 @@ async def refresh_known_stop_ids_if_due(state: RuntimeState, force: bool = False
     )
 
 
-async def refresh_static_fallback_index_if_due(state: RuntimeState, force: bool = False) -> None:
+async def _run_static_fallback_index_refresh(
+    state: RuntimeState,
+    target_stop_ids: list[str],
+    timeout_seconds: int,
+    reload_in_seconds: int,
+    cached_entries: int,
+) -> None:
+    started_at = time.monotonic()
+    load_error: Optional[str] = None
+    loaded_entries = 0
+
+    try:
+        index, load_error = await asyncio.to_thread(
+            load_static_fallback_index_for_stop_ids,
+            target_stop_ids,
+            timeout_seconds,
+        )
+        if index is not None:
+            loaded_entries = sum(len(items) for items in index.stop_entries.values())
+    except Exception as exc:
+        index = None
+        load_error = f"static fallback refresh failed: {exc}"
+
+    async with state.lock:
+        if index is not None:
+            state.static_fallback_index = index
+            state.static_fallback_error = None
+        elif load_error:
+            state.static_fallback_error = load_error
+        state.next_static_fallback_reload_monotonic = time.monotonic() + reload_in_seconds
+        current_task = asyncio.current_task()
+        if state.static_fallback_refresh_task is current_task:
+            state.static_fallback_refresh_task = None
+
+    debug_log(
+        "fallback_static:refresh "
+        f"stop_ids={len(target_stop_ids)} loaded_entries={loaded_entries} cached_before={cached_entries} "
+        f"had_error={bool(load_error)} next_in_s={reload_in_seconds} duration_s={time.monotonic() - started_at:.2f}"
+    )
+
+
+async def refresh_static_fallback_index_if_due(
+    state: RuntimeState,
+    force: bool = False,
+    wait: bool = False,
+) -> None:
     target_stop_ids = all_widget_stop_ids(state.config, source="gtfs_rt")
     if not target_stop_ids:
         return
 
     now_monotonic = time.monotonic()
+    task_to_await: Optional[asyncio.Task] = None
+    started_new_task = False
+
     async with state.lock:
+        existing_task = state.static_fallback_refresh_task
+        if existing_task is not None and existing_task.done():
+            state.static_fallback_refresh_task = None
+            existing_task = None
+
         should_reload = (
             force
             or state.static_fallback_index is None
@@ -2276,34 +2334,34 @@ async def refresh_static_fallback_index_if_due(state: RuntimeState, force: bool 
             if state.static_fallback_index is not None
             else 0
         )
-    if not should_reload:
-        return
 
-    started_at = time.monotonic()
-    index, load_error = await asyncio.to_thread(
-        load_static_fallback_index_for_stop_ids,
-        target_stop_ids,
-        timeout_seconds,
-    )
+        if not should_reload:
+            return
 
-    loaded_entries = 0
-    if index is not None:
-        loaded_entries = sum(len(items) for items in index.stop_entries.values())
+        if existing_task is None:
+            existing_task = asyncio.create_task(
+                _run_static_fallback_index_refresh(
+                    state,
+                    target_stop_ids,
+                    timeout_seconds,
+                    reload_in_seconds,
+                    cached_entries,
+                )
+            )
+            state.static_fallback_refresh_task = existing_task
+            started_new_task = True
 
-    async with state.lock:
-        if index is not None:
-            state.static_fallback_index = index
-            state.static_fallback_error = None
-        elif load_error:
-            state.static_fallback_error = load_error
-        state.next_static_fallback_reload_monotonic = time.monotonic() + reload_in_seconds
+        if wait:
+            task_to_await = existing_task
 
-    debug_log(
-        "fallback_static:refresh "
-        f"stop_ids={len(target_stop_ids)} loaded_entries={loaded_entries} cached_before={cached_entries} "
-        f"had_error={bool(load_error)} next_in_s={reload_in_seconds} duration_s={time.monotonic() - started_at:.2f}"
-    )
+    if started_new_task:
+        debug_log(
+            "fallback_static:refresh_scheduled "
+            f"stop_ids={len(target_stop_ids)} wait={int(wait)}"
+        )
 
+    if task_to_await is not None:
+        await task_to_await
 
 async def run_static_cache_warmup(state: RuntimeState) -> None:
     started_at = time.monotonic()
@@ -2335,7 +2393,7 @@ async def run_static_cache_warmup(state: RuntimeState) -> None:
     )
 
     await refresh_known_stop_ids_if_due(state, force=True)
-    await refresh_static_fallback_index_if_due(state, force=True)
+    await refresh_static_fallback_index_if_due(state, force=True, wait=True)
 
 
 async def run_startup_warmup(state: RuntimeState) -> None:
@@ -2524,11 +2582,18 @@ def create_app(config: AppConfig) -> FastAPI:
             yield
         finally:
             async with state.lock:
-                task = state.startup_task
-            if task is not None and not task.done():
-                task.cancel()
+                startup_task_ref = state.startup_task
+                static_fallback_task_ref = state.static_fallback_refresh_task
+
+            if startup_task_ref is not None and not startup_task_ref.done():
+                startup_task_ref.cancel()
                 with suppress(asyncio.CancelledError):
-                    await task
+                    await startup_task_ref
+
+            if static_fallback_task_ref is not None and not static_fallback_task_ref.done():
+                static_fallback_task_ref.cancel()
+                with suppress(asyncio.CancelledError):
+                    await static_fallback_task_ref
 
     app = FastAPI(title="timetable-widget", version=APP_VERSION, lifespan=lifespan)
     app.state.runtime = state
@@ -2748,83 +2813,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
