@@ -1,6 +1,12 @@
-﻿# Changelog
+# Changelog
 
 Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
+
+## [1.3.1] - 2026-02-24
+
+### Geändert
+- docker-compose.yml auf registry-basierten Betrieb umgestellt (image: ifsnet/timetable-widget:latest statt lokalem build).
+- Release-/Synology-Hinweise präzisiert: Update-Erkennung erfolgt digest-basiert über Docker Hub.
 
 ## [1.3.0] - 2026-02-24
 

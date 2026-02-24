@@ -1,6 +1,6 @@
-﻿services:
+services:
   timetable-widget:
-    build: .
+    image: ifsnet/timetable-widget:latest
     container_name: timetable-widget
     restart: unless-stopped
     volumes:

@@ -34,7 +34,7 @@ Hinweis zu Windows/Docker Desktop:
 - `docker-compose.yml` nutzt standardmäßig lokale Projektordner (`./config`, `./data`, `./logs`). Optional per Shell-Environment: `CONFIG_DIR`, `DATA_DIR`, `LOGS_DIR`.
 
 ```bash
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 ## URLs
@@ -283,7 +283,7 @@ cd /pfad/zu/timetable-widget
 git fetch origin
 git checkout main
 git pull --ff-only origin main
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 Optional danach aufräumen:
@@ -299,7 +299,7 @@ cd U:\timetable-widget
 git fetch origin
 git checkout main
 git pull --ff-only origin main
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 ### Docker Hub Publish (Synology-sicher)
@@ -324,7 +324,7 @@ Wenn das Projekt als Ordner auf der NAS liegt (z. B. `/volume1/docker/timetable-
 2. In den Projektordner wechseln.
 3. `git pull --ff-only origin main` ausführen.
 4. Container neu bauen/starten:
-   `docker compose up -d --build`
+   `docker compose pull && docker compose up -d`
 5. Optional im Container Manager den Projektstatus kontrollieren.
 
 ### Falls lokale Änderungen vorhanden sind
@@ -335,7 +335,7 @@ Wenn `git pull` wegen lokaler Änderungen fehlschlägt:
 git status
 git stash
 git pull --ff-only origin main
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 Danach bei Bedarf eigene Änderungen wiederherstellen:
@@ -349,7 +349,7 @@ git stash pop
 ```bash
 git log --oneline -n 5
 git checkout <commit_hash>
-docker compose up -d --build
+docker compose pull && docker compose up -d
 ```
 
 Hinweis: Für den Rückweg auf aktuellen Stand wieder `git checkout main` und `git pull --ff-only origin main` nutzen.

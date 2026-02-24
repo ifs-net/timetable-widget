@@ -1,12 +1,12 @@
-﻿FROM python:3.12-slim
+FROM python:3.12-slim
 
 ARG APP_UID=10001
 ARG APP_GID=10001
-ARG APP_VERSION=1.3.0
+ARG APP_VERSION=1.3.1
 ENV APP_VERSION=${APP_VERSION}
 
 LABEL org.opencontainers.image.title="timetable-widget" \
-      org.opencontainers.image.description="Konfigurierbares ÖPNV-Abfahrts-Widget mit GTFS-Realtime und DB-Timetables" \
+      org.opencontainers.image.description="Konfigurierbares �PNV-Abfahrts-Widget mit GTFS-Realtime und DB-Timetables" \
       org.opencontainers.image.source="https://github.com/ifs-net/timetable-widget" \
       org.opencontainers.image.url="https://github.com/ifs-net/timetable-widget" \
       org.opencontainers.image.licenses="MIT" \
