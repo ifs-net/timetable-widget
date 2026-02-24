@@ -46,6 +46,7 @@ docker compose pull && docker compose up -d
 - `http://<Docker-Container-IP>:8000/json/1/24h` (JSON für konkretes Widget nach ID, 24h-Ansicht)
 - `http://<Docker-Container-IP>:8000/` (technische Startseite mit Endpunkt-Übersicht)
 - `http://<Docker-Container-IP>:8000/health`
+- `http://<Docker-Container-IP>:8000/version` (Build-Metadaten: app_version, app_git_sha, app_build_date)
 - `http://<Docker-Container-IP>:8000/logs` (Live-Logansicht mit den letzten Logeinträgen)
 - `http://<Docker-Container-IP>:8000/switchdebugmode` (GUI zum Umschalten des Debug-Modus)
 
@@ -317,6 +318,30 @@ docker buildx build \
   -t ifsnet/timetable-widget:<version> \
   -t ifsnet/timetable-widget:latest \
   --push .
+```
+Empfohlener verifizierter Release-Workflow (PowerShell):
+
+```powershell
+./scripts/release_push_and_verify.ps1
+```
+
+Der Workflow:
+- baut und pusht Multi-Arch fuer `linux/amd64` und `linux/arm64`
+- setzt Build-Metadaten (`APP_VERSION`, `APP_GIT_SHA`, `APP_BUILD_DATE`)
+- prueft, ob `latest` auf denselben Digest wie `<version>` zeigt
+- prueft, ob sich der `latest`-Digest gegenueber vorher geaendert hat
+
+Manueller Fallback mit Build-Metadaten:
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --provenance=false \
+  --sbom=false \
+  --build-arg APP_VERSION=<version> \
+  --build-arg APP_GIT_SHA=$(git rev-parse --short HEAD) \
+  --build-arg APP_BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  -t ifsnet/timetable-widget:<version> -t ifsnet/timetable-widget:latest --push .
 ```
 
 ### Update Auf Synology Container Manager

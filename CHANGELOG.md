@@ -2,6 +2,18 @@
 
 Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
 
+## [1.3.3] - 2026-02-24
+
+### Hinzugefuegt
+- Neuer API-Endpunkt `/version` mit Build-Metadaten (`app_version`, `app_git_sha`, `app_build_date`).
+- Neues Release-Skript `scripts/release_push_and_verify.ps1` fuer Build, Push und Digest-Pruefung.
+
+### Geaendert
+- `/health` und `/logs` liefern jetzt ebenfalls Build-Metadaten (`app_git_sha`, `app_build_date`).
+- Dockerfile um Build-Argumente und Umgebungsvariablen fuer `APP_GIT_SHA` und `APP_BUILD_DATE` erweitert.
+- OCI-Labels im Dockerfile um `org.opencontainers.image.revision` und `org.opencontainers.image.created` erweitert.
+- README um `/version` sowie den verifizierten Release-Workflow ergaenzt.
+
 ## [1.3.2] - 2026-02-24
 
 ### Hinzugefügt
@@ -106,4 +118,3 @@ Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
 - HTML-Widget und JSON-Endpunkte pro Widget-ID.
 - On-Demand-Refresh mit Caching, Warmup-Optionen und Debug-Logging.
 - Statischer GTFS-Fallback inklusive Fahrtrichtungsermittlung.
-
