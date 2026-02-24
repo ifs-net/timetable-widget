@@ -8,6 +8,7 @@ Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
 - Provider-Logik aufgeteilt: `gtfs_rt` und `db_timetables` in eigene Module ausgelagert.
 - Service-/Polling-Logik in separates Modul ausgelagert.
 - `/logs`-Ansicht verbessert: Auto-Scroll standardmäßig aktiv, per Checkbox deaktivierbar.
+- README ergänzt: klare Hinweise zu direction_overrides.txt (echte Datei erforderlich) und Log-Auto-Scroll.
 
 ### Performance
 - Kaltstart-Pfad optimiert, damit erste Antworten schneller verfügbar sind.
@@ -90,3 +91,4 @@ Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
 - HTML-Widget und JSON-Endpunkte pro Widget-ID.
 - On-Demand-Refresh mit Caching, Warmup-Optionen und Debug-Logging.
 - Statischer GTFS-Fallback inklusive Fahrtrichtungsermittlung.
+
