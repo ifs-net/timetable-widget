@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 ARG APP_UID=10001
 ARG APP_GID=10001
-ARG APP_VERSION=1.3.1
+ARG APP_VERSION=1.3.2-DEV
 ENV APP_VERSION=${APP_VERSION}
 
 LABEL org.opencontainers.image.title="timetable-widget" \
