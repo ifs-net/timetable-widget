@@ -44,8 +44,53 @@ except ValueError:
     GTFS_STATIC_CACHE_MAX_AGE_SECONDS = 43200
 DB_IRIS_BASE_URL = os.getenv("DB_IRIS_BASE_URL", "https://apis.deutschebahn.com/db-api-marketplace/apis/timetables/v1")
 DB_TIMETABLES_BASE_URL = os.getenv("DB_TIMETABLES_BASE_URL", DB_IRIS_BASE_URL).rstrip("/")
-DB_CLIENT_ID = os.getenv("DB_CLIENT_ID", "").strip()
-DB_API_KEY = os.getenv("DB_API_KEY", "").strip()
+DB_APIKEY_FILE = os.getenv("DB_APIKEY_FILE", "/config/.dbapikey")
+
+
+def _read_env_key_value_file(path: str) -> dict[str, str]:
+    file_path = Path(path)
+    if not file_path.exists() or not file_path.is_file():
+        return {}
+
+    entries: dict[str, str] = {}
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except Exception:
+        return {}
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        entries[key] = value
+    return entries
+
+
+def resolve_db_credentials() -> tuple[str, str]:
+    env_client_id = os.getenv("DB_CLIENT_ID", "").strip()
+    env_api_key = os.getenv("DB_API_KEY", "").strip()
+    if env_client_id and env_api_key:
+        return env_client_id, env_api_key
+
+    apikey_file = str(os.getenv("DB_APIKEY_FILE", DB_APIKEY_FILE)).strip() or "/config/.dbapikey"
+    file_values = _read_env_key_value_file(apikey_file)
+    file_client_id = str(file_values.get("DB_CLIENT_ID", "")).strip()
+    file_api_key = str(file_values.get("DB_API_KEY", "")).strip()
+    return env_client_id or file_client_id, env_api_key or file_api_key
+
+
+DB_CLIENT_ID, DB_API_KEY = resolve_db_credentials()
 DEFAULT_DEBUG_LOG_PATH = "/logs/logfile.txt"
 DEBUG_LOG_PATH = DEFAULT_DEBUG_LOG_PATH
 WARMUP_ON_START = str(os.getenv("WARMUP_ON_START", "0")).strip().lower() in {"1", "true", "yes", "on"}
@@ -394,15 +439,15 @@ async def register_observed_direction_entries(
     )
 
 
-def build_db_timetables_headers() -> dict[str, str]:
+def build_db_timetables_headers(client_id: str, api_key: str) -> dict[str, str]:
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/xml",
     }
-    if DB_CLIENT_ID:
-        headers["DB-Client-Id"] = DB_CLIENT_ID
-    if DB_API_KEY:
-        headers["DB-Api-Key"] = DB_API_KEY
+    if client_id:
+        headers["DB-Client-Id"] = client_id
+    if api_key:
+        headers["DB-Api-Key"] = api_key
     return headers
 
 
@@ -1230,14 +1275,18 @@ async def fetch_db_iris_departures(widget: WidgetConfig, timeout_seconds: int, n
 
     now_local = to_local_datetime(now_epoch).replace(minute=0, second=0, microsecond=0)
     merged: list[Departure] = []
-    if not DB_CLIENT_ID or not DB_API_KEY:
-        raise ValueError("DB API credentials fehlen. Setze DB_CLIENT_ID und DB_API_KEY als Environment-Variablen (z. B. ueber config/.dbapikey).")
+    client_id, api_key = resolve_db_credentials()
+    if not client_id or not api_key:
+        raise ValueError(
+            "DB API credentials fehlen. Setze DB_CLIENT_ID und DB_API_KEY als Environment-Variablen "
+            "oder lege sie in /config/.dbapikey (bzw. DB_APIKEY_FILE) ab."
+        )
 
     debug_log(
         f"db_iris:fetch_start widget={widget.id} eva={eva_no} lookahead_h={widget.db_lookahead_hours}"
     )
 
-    async with httpx.AsyncClient(timeout=timeout_seconds, headers=build_db_timetables_headers()) as client:
+    async with httpx.AsyncClient(timeout=timeout_seconds, headers=build_db_timetables_headers(client_id, api_key)) as client:
         changes_by_event_id: dict[str, DBIrisEventChange] = {}
         if widget.db_use_fchg:
             fchg_started = time.monotonic()
@@ -3207,6 +3256,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 
