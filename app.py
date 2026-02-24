@@ -86,6 +86,8 @@ def load_app_version() -> str:
 
 
 APP_VERSION = load_app_version()
+APP_GIT_SHA = (os.getenv("APP_GIT_SHA", "") or "").strip() or "unknown"
+APP_BUILD_DATE = (os.getenv("APP_BUILD_DATE", "") or "").strip() or "unknown"
 GTFS_STATIC_URL = os.getenv("GTFS_STATIC_URL", "https://download.gtfs.de/germany/nv_free/latest.zip")
 GTFS_STATIC_CACHE_PATH = os.getenv("GTFS_STATIC_CACHE_PATH", "/data/nv_free_latest.zip")
 STATIC_FALLBACK_INDEX_CACHE_PATH = os.getenv("STATIC_FALLBACK_INDEX_CACHE_PATH", "/data/static_fallback_index_cache.pkl")
@@ -2576,6 +2578,8 @@ def create_app(config: AppConfig) -> FastAPI:
             return JSONResponse(
                 {
                     "app_version": APP_VERSION,
+                    "app_git_sha": APP_GIT_SHA,
+                    "app_build_date": APP_BUILD_DATE,
                     "log_path": ACTIVE_LOG_PATH,
                     "tail_lines": lines,
                     "read_error": read_error,
@@ -2641,6 +2645,16 @@ def create_app(config: AppConfig) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Widget-ID {widget_id} nicht gefunden.")
         payload = await _build_json_payload(widget, "24h")
         return JSONResponse(payload)
+    @app.get("/version", response_class=JSONResponse)
+    async def get_version() -> JSONResponse:
+        return JSONResponse(
+            {
+                "app_version": APP_VERSION,
+                "app_git_sha": APP_GIT_SHA,
+                "app_build_date": APP_BUILD_DATE,
+            }
+        )
+
     @app.get("/health", response_class=JSONResponse)
     async def get_health() -> JSONResponse:
         async with state.lock:
@@ -2653,6 +2667,8 @@ def create_app(config: AppConfig) -> FastAPI:
             {
                 "ok": True,
                 "app_version": APP_VERSION,
+                "app_git_sha": APP_GIT_SHA,
+                "app_build_date": APP_BUILD_DATE,
                 "age_s": age_seconds(fetched_at_epoch),
                 "errors": aggregated_errors,
             }
