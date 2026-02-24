@@ -2,6 +2,13 @@
 
 Alle relevanten Ã„nderungen dieses Projekts werden hier dokumentiert.
 
+## [1.2.1] - 2026-02-24
+
+### Geaendert
+- Release-Pipeline fuer Synology-Update-Erkennung abgesichert: Docker-Buildx-Push ohne Attestations.
+- Docker Hub Push fuer `latest` und Versionstag erfolgt mit `--provenance=false` und `--sbom=false`.
+
+
 ## [1.2.0] - 2026-02-24
 
 ### Geaendert

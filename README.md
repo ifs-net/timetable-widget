@@ -294,6 +294,20 @@ git pull --ff-only origin main
 docker compose up -d --build
 ```
 
+### Docker Hub Publish (Synology-sicher)
+
+Fuer Releases sollte der Multi-Arch-Push ohne Attestations erfolgen, damit Synology Updates fuer `latest` zuverlaessig erkennt:
+
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --provenance=false \
+  --sbom=false \
+  -t ifsnet/timetable-widget:<version> \
+  -t ifsnet/timetable-widget:latest \
+  --push .
+```
+
 ### Update Auf Synology Container Manager
 
 Wenn das Projekt als Ordner auf der NAS liegt (z. B. `/volume1/docker/timetable-widget`):
