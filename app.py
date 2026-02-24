@@ -46,8 +46,8 @@ DB_IRIS_BASE_URL = os.getenv("DB_IRIS_BASE_URL", "https://apis.deutschebahn.com/
 DB_TIMETABLES_BASE_URL = os.getenv("DB_TIMETABLES_BASE_URL", DB_IRIS_BASE_URL).rstrip("/")
 DB_CLIENT_ID = os.getenv("DB_CLIENT_ID", "").strip()
 DB_API_KEY = os.getenv("DB_API_KEY", "").strip()
-DEBUG_MODE = str(os.getenv("DEBUG_MODE", "0")).strip().lower() in {"1", "true", "yes", "on"}
-DEBUG_LOG_PATH = os.getenv("DEBUG_LOG_PATH", "/logs/logfile.txt")
+DEFAULT_DEBUG_LOG_PATH = "/logs/logfile.txt"
+DEBUG_LOG_PATH = DEFAULT_DEBUG_LOG_PATH
 WARMUP_ON_START = str(os.getenv("WARMUP_ON_START", "0")).strip().lower() in {"1", "true", "yes", "on"}
 WARMUP_STATIC_CACHE_ON_START = str(os.getenv("WARMUP_STATIC_CACHE_ON_START", "1")).strip().lower() in {"1", "true", "yes", "on"}
 LOCAL_TIMEZONE_NAME = os.getenv("LOCAL_TIMEZONE", "Europe/Berlin")
@@ -167,7 +167,7 @@ def get_debug_status() -> dict:
         }
 
 
-configure_debug_logger(DEBUG_MODE, DEBUG_LOG_PATH)
+configure_debug_logger(False, DEBUG_LOG_PATH)
 
 
 def debug_log(message: str) -> None:
@@ -420,6 +420,12 @@ class FeedConfig:
 
 
 @dataclass
+class DebugConfig:
+    enabled: bool
+    log_path: str
+
+
+@dataclass
 class WidgetConfig:
     id: str
     title: str
@@ -448,6 +454,7 @@ class MappingConfig:
 class AppConfig:
     server: ServerConfig
     feed: FeedConfig
+    debug: DebugConfig
     widgets: list[WidgetConfig]
     mapping: MappingConfig
 
@@ -627,6 +634,7 @@ def _normalize_widget_source(value, key: str) -> str:
 def parse_config(data: dict) -> AppConfig:
     server_data = _get_section(data, "server")
     feed_data = _get_section(data, "feed")
+    debug_data = _get_section(data, "debug")
     mapping_data = _get_section(data, "mapping")
 
     server = ServerConfig(
@@ -639,6 +647,10 @@ def parse_config(data: dict) -> AppConfig:
         http_timeout_seconds=_to_int(
             feed_data.get("http_timeout_seconds"), 15, "feed.http_timeout_seconds", min_value=1
         ),
+    )
+    debug = DebugConfig(
+        enabled=_to_bool(debug_data.get("enabled"), False),
+        log_path=_to_non_empty_str(debug_data.get("log_path"), DEFAULT_DEBUG_LOG_PATH, "debug.log_path"),
     )
     widgets_data = data.get("widgets")
     if widgets_data is None:
@@ -711,7 +723,7 @@ def parse_config(data: dict) -> AppConfig:
         ),
     )
 
-    return AppConfig(server=server, feed=feed, widgets=widgets, mapping=mapping)
+    return AppConfig(server=server, feed=feed, debug=debug, widgets=widgets, mapping=mapping)
 
 
 def all_widget_stop_ids(config: AppConfig, source: Optional[str] = None) -> list[str]:
@@ -1219,7 +1231,7 @@ async def fetch_db_iris_departures(widget: WidgetConfig, timeout_seconds: int, n
     now_local = to_local_datetime(now_epoch).replace(minute=0, second=0, microsecond=0)
     merged: list[Departure] = []
     if not DB_CLIENT_ID or not DB_API_KEY:
-        raise ValueError("DB API credentials fehlen. Setze DB_CLIENT_ID und DB_API_KEY als Environment-Variablen.")
+        raise ValueError("DB API credentials fehlen. Setze DB_CLIENT_ID und DB_API_KEY als Environment-Variablen (z. B. ueber config/.dbapikey).")
 
     debug_log(
         f"db_iris:fetch_start widget={widget.id} eva={eva_no} lookahead_h={widget.db_lookahead_hours}"
@@ -3048,6 +3060,10 @@ def build_config_excerpt(config: AppConfig) -> dict:
             "refresh_seconds": config.feed.refresh_seconds,
             "http_timeout_seconds": config.feed.http_timeout_seconds,
         },
+        "debug": {
+            "enabled": config.debug.enabled,
+            "log_path": config.debug.log_path,
+        },
         "widgets": [
             {
                 "id": widget.id,
@@ -3184,6 +3200,7 @@ def create_app(config: AppConfig) -> FastAPI:
 def main() -> None:
     config_data = load_yaml(CONFIG_PATH)
     config = parse_config(config_data)
+    configure_debug_logger(config.debug.enabled, config.debug.log_path)
     app = create_app(config)
     uvicorn.run(app, host=config.server.host, port=config.server.port)
 

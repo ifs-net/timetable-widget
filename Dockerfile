@@ -2,7 +2,7 @@
 
 ARG APP_UID=10001
 ARG APP_GID=10001
-ARG APP_VERSION=1.1.2
+ARG APP_VERSION=1.2.0
 
 LABEL org.opencontainers.image.title="timetable-widget" \
       org.opencontainers.image.description="Konfigurierbares ÖPNV-Abfahrts-Widget mit GTFS-Realtime und DB-Timetables" \

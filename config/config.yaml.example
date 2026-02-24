@@ -7,6 +7,10 @@ feed:
   refresh_seconds: 30
   http_timeout_seconds: 15
 
+debug:
+  enabled: false
+  log_path: "/logs/logfile.txt"
+
 widgets:
   - id: "1"
     title: "Dechbetten/TELIS FINANZ"

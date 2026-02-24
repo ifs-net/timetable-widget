@@ -2,6 +2,22 @@
 
 Alle relevanten Ã„nderungen dieses Projekts werden hier dokumentiert.
 
+## [1.2.0] - 2026-02-24
+
+### Geaendert
+- DB-Credentials werden jetzt aus `config/.dbapikey` geladen (statt Root-`.env`).
+- Compose nutzt dafuer `env_file` mit `DB_APIKEY_FILE`-Override.
+- Debug-Konfiguration wurde in die YAML verschoben (`debug.enabled`, `debug.log_path`).
+- Root-Endpoint `/` bleibt als technische Endpunkt-Uebersicht verfuegbar.
+
+### Hinzugefuegt
+- Neue Vorlage `config/.dbapikey.example`.
+- Beispielkonfiguration `config/config.yaml.example` um `debug`-Abschnitt erweitert.
+
+### Entfernt
+- Root-Datei `.env.example` wurde entfernt.
+
+
 ## [1.1.2] - 2026-02-23
 
 ### Geaendert

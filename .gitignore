@@ -9,3 +9,4 @@ temp_backups/
 
 config/direction_overrides.txt
 config/config.yaml
+config/.dbapikey

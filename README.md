@@ -11,10 +11,10 @@ Die Lösung ist aber nicht auf den RVV beschränkt, sondern universell einsetzba
 ```bash
 cp config/config.yaml.example config/config.yaml
 cp config/direction_overrides.txt.example config/direction_overrides.txt
-cp .env.example .env
+cp config/.dbapikey.example config/.dbapikey
 ```
 
-In `.env` die DB-Zugangsdaten für den DB API Marketplace eintragen (free subscription plan verfügbar):
+In `config/.dbapikey` die DB-Zugangsdaten für den DB API Marketplace eintragen (free subscription plan verfügbar):
 
 ```env
 DB_CLIENT_ID=<deine_client_id>
@@ -31,7 +31,7 @@ Hinweis zu Windows/Docker Desktop:
 - In manchen Setups (insbesondere bei Netzlaufwerken) wird ein Datei-Bind-Mount als Verzeichnis interpretiert.
 - Deshalb ist der Compose-Standard hier ohne Datei-Bind-Mount umgesetzt.
 - Falls `CONFIG_PATH` auf ein Verzeichnis zeigt, nutzt die App automatisch einen Fallback (`FALLBACK_CONFIG_PATH`).
-- `docker-compose.yml` nutzt standardmaessig lokale Projektordner (`./config`, `./data`, `./logs`). Optional per `.env`: `CONFIG_DIR`, `DATA_DIR`, `LOGS_DIR`.
+- `docker-compose.yml` nutzt standardmaessig lokale Projektordner (`./config`, `./data`, `./logs`). Optional per Shell-Environment: `CONFIG_DIR`, `DATA_DIR`, `LOGS_DIR`.
 
 ```bash
 docker compose up -d --build
@@ -170,7 +170,7 @@ Verhalten:
 
 ## DB API Credentials
 
-Für `source: "db_iris"` sind folgende Environment-Variablen erforderlich:
+Für `source: "db_iris"` sind folgende Environment-Variablen erforderlich (Compose laedt sie aus `config/.dbapikey`):
 
 - `DB_CLIENT_ID`
 - `DB_API_KEY`
@@ -217,12 +217,12 @@ Variante A: Container Manager Projekt (empfohlen)
 1. Projektordner auf die NAS kopieren (z. B. nach `/volume1/docker/timetable-widget`).
 2. In Synology: Container Manager -> Projekt -> Erstellen.
 3. Quelle: Lokales Verzeichnis auswählen und den Projektordner wählen.
-4. `.env` im Projektordner anlegen (aus `.env.example`) und DB-Werte setzen:
+4. `config/.dbapikey` anlegen (aus `config/.dbapikey.example`) und DB-Werte setzen:
    - `DB_CLIENT_ID=<deine_client_id>`
    - `DB_API_KEY=<dein_api_key>`
 5. `docker-compose.yml` wird erkannt. Vor dem Start Pfade und Mounts an die eigene NAS-Struktur anpassen (Config/Logs/Data). Optional Environment setzen:
    - `USER_AGENT` falls gewünscht
-   - `DEBUG_MODE=1` und `DEBUG_LOG_PATH=/logs/logfile.txt` falls Debug
+   - Debug ueber `config/config.yaml` steuern (`debug.enabled`, `debug.log_path`)
    - `WARMUP_STATIC_CACHE_ON_START=1` für Static-Cache-Warmup
    - `WARMUP_ON_START=1` für kompletten Daten-Warmup
    - `DIRECTION_MAPPING_PATH=/config/direction_overrides.txt` für Custom-Richtungslabels
@@ -254,7 +254,7 @@ Variante C: Image bauen und Container manuell erstellen
    ```
 2. Container starten:
    ```bash
-   docker run -d --name timetable-widget -p 8000:8000 --env-file .env timetable-widget:latest
+   docker run -d --name timetable-widget -p 8000:8000 --env-file config/.dbapikey timetable-widget:latest
    ```
 3. Optional Volumes/Environment wie in Variante B setzen, falls externe Config oder Logs genutzt werden sollen.
 
@@ -266,7 +266,7 @@ Repository: `https://github.com/ifs-net/timetable-widget.git`
 Voraussetzungen:
 
 - Das Projekt liegt lokal in einem Git-Checkout.
-- `.env` (mit API-Keys) und ggf. externe Config-Dateien bleiben erhalten und werden nicht aus Git überschrieben.
+- `config/.dbapikey` (mit API-Keys) und ggf. externe Config-Dateien bleiben erhalten und werden nicht aus Git überschrieben.
 
 ### Standard Update (CLI)
 
@@ -345,8 +345,8 @@ Bitte bezüglich des eigenen Einsatzes selbst jeweils die rechtlichen Rahmenbedi
 
 ## Debug-Modus
 
-- Startwert per Umgebung: `DEBUG_MODE=1` (oder `0`).
-- Standard-Logpfad: `DEBUG_LOG_PATH=/logs/logfile.txt`.
+- Startwert ueber YAML: `debug.enabled: true|false` in `config/config.yaml`.
+- Standard-Logpfad ueber YAML: `debug.log_path: "/logs/logfile.txt"`.
 - Optional feste Kennung je Instanz: `LOG_INSTANCE_IP` (sonst automatische Erkennung).
 - Bei Compose ist `./logs:/logs` gemountet, Logdatei lokal unter `logs/logfile.txt`.
 - Laufzeit-Umschaltung ohne Container-Neustart:
