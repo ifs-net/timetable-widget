@@ -2,6 +2,15 @@
 
 Alle relevanten Änderungen dieses Projekts werden hier dokumentiert.
 
+## [1.3.2] - 2026-02-24
+
+### Hinzugefügt
+- Neuer Endpunkt `/switchdebugmode` mit GUI (Dropdown + Anwenden) zum Umschalten des Debug-Modus.
+
+### Geändert
+- Startseite (`/`) um Link zum Debug-Umschalter ergänzt.
+- README um Hinweise zu `/switchdebugmode` sowie zum erwartbaren Kaltstart-Verhalten beim statischen GTFS-Fallback ergänzt.
+
 ## [1.3.1] - 2026-02-24
 
 ### Geändert

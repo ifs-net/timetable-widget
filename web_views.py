@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import html
 import json
@@ -550,6 +550,7 @@ def render_service_index_html(
         ("JSON (24h)", f"{root}/json/<id>/24h", "JSON-Daten fuer 24h-Ansicht"),
         ("Health", f"{root}/health", "Technischer Status und Feed-Alter"),
         ("Debug-Status", f"{root}/debug", "Aktueller Debug-Modus"),
+        ("Debug-Umschalter", f"{root}/switchdebugmode", "Debug-Modus per GUI umschalten"),
         ("Logs", f"{root}/logs", f"Letzte {log_tail_lines} Log-Eintraege (Live-Ansicht)"),
         ("OpenAPI", f"{root}/docs", "Interaktive API-Dokumentation"),
     ]
@@ -644,3 +645,68 @@ def render_service_index_html(
 </html>
 """
 
+
+
+def render_switch_debug_mode_html(
+    base_url: str,
+    debug_status: dict[str, Any],
+    message: Optional[str],
+    message_ok: bool,
+    *,
+    app_version: str,
+) -> str:
+    root = base_url.rstrip("/")
+    enabled = bool(debug_status.get("enabled"))
+    selected_on = " selected" if enabled else ""
+    selected_off = " selected" if not enabled else ""
+    current_mode = "aktiviert" if enabled else "deaktiviert"
+    log_path = str(debug_status.get("active_log_path") or debug_status.get("log_path") or "-")
+
+    message_html = ""
+    if message:
+        msg_class = "msg-ok" if message_ok else "msg-err"
+        message_html = f"<div class='{msg_class}'>{html.escape(message)}</div>"
+
+    return f"""<!doctype html>
+<html lang=\"de\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>Debug-Umschalter - timetable-widget v{html.escape(app_version)}</title>
+  <style>
+    body {{ font-family: \"Segoe UI\", Tahoma, sans-serif; margin: 16px; background: #f5f7fb; color: #1f2937; }}
+    .card {{ max-width: 680px; background: #fff; border: 1px solid #d1d5db; border-radius: 8px; padding: 16px; }}
+    h2 {{ margin-top: 0; margin-bottom: 12px; }}
+    .meta {{ margin-bottom: 12px; color: #374151; font-size: 14px; }}
+    .row {{ margin-bottom: 12px; }}
+    label {{ display: inline-block; margin-bottom: 6px; font-weight: 600; }}
+    select {{ min-width: 220px; padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 14px; }}
+    button {{ padding: 8px 12px; background: #0b4f8a; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }}
+    button:hover {{ background: #0a436f; }}
+    .msg-ok {{ background: #ecfdf5; border: 1px solid #6ee7b7; color: #065f46; padding: 10px; border-radius: 8px; margin-bottom: 12px; }}
+    .msg-err {{ background: #fef2f2; border: 1px solid #fca5a5; color: #991b1b; padding: 10px; border-radius: 8px; margin-bottom: 12px; }}
+    a {{ color: #0b4f8a; text-decoration: none; }}
+  </style>
+</head>
+<body>
+  <div class=\"card\">
+    <h2>Debug-Modus umschalten</h2>
+    <div class=\"meta\">Aktueller Modus: <strong>{html.escape(current_mode)}</strong> | Logdatei: <code>{html.escape(log_path)}</code> | Version: {html.escape(app_version)}</div>
+    {message_html}
+    <form method=\"post\" action=\"{html.escape(f'{root}/switchdebugmode')}\">
+      <div class=\"row\">
+        <label for=\"debug_mode\">Debug-Modus</label><br/>
+        <select id=\"debug_mode\" name=\"debug_mode\">
+          <option value=\"on\"{selected_on}>aktiviert</option>
+          <option value=\"off\"{selected_off}>deaktiviert</option>
+        </select>
+      </div>
+      <div class=\"row\">
+        <button type=\"submit\">Anwenden</button>
+      </div>
+    </form>
+    <div class=\"meta\"><a href=\"{html.escape(f'{root}/')}\">Zur Startseite</a> | <a href=\"{html.escape(f'{root}/debug')}\">Debug-Status (JSON)</a> | <a href=\"{html.escape(f'{root}/logs')}\">Logs</a></div>
+  </div>
+</body>
+</html>
+"""

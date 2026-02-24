@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import csv
@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -48,6 +49,7 @@ from service_polling import (
 from web_views import (
     render_logs_html as views_render_logs_html,
     render_service_index_html as views_render_service_index_html,
+    render_switch_debug_mode_html as views_render_switch_debug_mode_html,
     render_widget_html as views_render_widget_html,
     render_widget_index_html as views_render_widget_index_html,
 )
@@ -2428,6 +2430,20 @@ def render_service_index_html(
     )
 
 
+
+def render_switch_debug_mode_html(
+    base_url: str,
+    debug_status: dict,
+    message: Optional[str],
+    message_ok: bool,
+) -> str:
+    return views_render_switch_debug_mode_html(
+        base_url,
+        debug_status,
+        message,
+        message_ok,
+        app_version=APP_VERSION,
+    )
 def build_config_excerpt(config: AppConfig) -> dict:
     return {
         "server": {
@@ -2642,6 +2658,41 @@ def create_app(config: AppConfig) -> FastAPI:
             }
         )
 
+
+    @app.get("/switchdebugmode", response_class=HTMLResponse)
+    async def get_switch_debug_mode(request: Request, message: Optional[str] = None, status: Optional[str] = None) -> HTMLResponse:
+        message_ok = (status or "ok").strip().lower() != "error"
+        return HTMLResponse(
+            render_switch_debug_mode_html(
+                str(request.base_url),
+                get_debug_status(),
+                message,
+                message_ok,
+            )
+        )
+
+    @app.post("/switchdebugmode", response_class=HTMLResponse)
+    async def post_switch_debug_mode(request: Request) -> HTMLResponse:
+        raw_body = (await request.body()).decode("utf-8", errors="ignore")
+        form_data = parse_qs(raw_body, keep_blank_values=True)
+        mode = str(form_data.get("debug_mode", [""])[0]).strip().lower()
+
+        if mode == "on":
+            ok, message = configure_debug_logger(True)
+        elif mode == "off":
+            ok, message = configure_debug_logger(False)
+        else:
+            ok = False
+            message = "Ungültiger Wert für Debug-Modus. Erlaubt sind on oder off."
+
+        return HTMLResponse(
+            render_switch_debug_mode_html(
+                str(request.base_url),
+                get_debug_status(),
+                message,
+                ok,
+            )
+        )
     @app.get("/debug", response_class=JSONResponse)
     async def get_debug_config() -> JSONResponse:
         return JSONResponse(get_debug_status())

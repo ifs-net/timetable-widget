@@ -46,6 +46,8 @@ docker compose pull && docker compose up -d
 - `http://<Docker-Container-IP>:8000/json/1/24h` (JSON für konkretes Widget nach ID, 24h-Ansicht)
 - `http://<Docker-Container-IP>:8000/` (technische Startseite mit Endpunkt-Übersicht)
 - `http://<Docker-Container-IP>:8000/health`
+- `http://<Docker-Container-IP>:8000/logs` (Live-Logansicht mit den letzten Logeinträgen)
+- `http://<Docker-Container-IP>:8000/switchdebugmode` (GUI zum Umschalten des Debug-Modus)
 
 
 ## Hinweise zu Overrides und Logs
@@ -205,6 +207,7 @@ config:
 
 - Für `source: "gtfs_rt"` wird zuerst ausschließlich aus dem Echtzeit-Feed gelesen.
 - Falls weniger Treffer als `max_departures` vorhanden sind, wird mit statischen GTFS-Fahrplänen bis zum Limit ergänzt.
+- Beim frischen Container-Start kann es in den ersten 1 bis 2 Minuten vorkommen, dass noch nicht alle statischen Ergänzungen sichtbar sind (z. B. fehlende Linien/Fahrtrichtungen). Nach dem ersten vollständigen Refresh ist die Anzeige wieder vollständig.
 - In der 24h-Ansicht werden Realtime und statischer Fallback ebenfalls zusammengeführt, aber ohne Begrenzung auf `max_departures`.
 - Die 24h-Berechnung ist serverseitig kurz gecacht (TTL = `feed.refresh_seconds`), damit wiederholte Ajax-Refreshes performant bleiben.
 - Deduplizierung priorisiert Echtzeitdaten. Statische Fahrten werden verworfen, wenn eine passende Live-Fahrt bereits vorhanden ist (über `trip_id+stop_id` sowie zusätzlich Linie/Richtung/Stop im Zeitfenster mit Verspätungsabgleich).
@@ -376,6 +379,8 @@ Bitte bezüglich des eigenen Einsatzes selbst jeweils die rechtlichen Rahmenbedi
 - `POST /debug/on` aktiviert Debug-Logging.
 - `POST /debug/on?log_path=/logs/mein-debug.log` aktiviert Debug mit anderem Logpfad.
 - `POST /debug/off` deaktiviert Debug-Logging.
+- `GET /switchdebugmode` zeigt eine GUI mit Dropdown (aktueller Wert vorbelegt) und Button zum Umschalten.
+- `POST /switchdebugmode` wendet die Auswahl aus der GUI an.
 - Die Debug-Logs enthalten Stage-Timings für Analyse: `mapping_csv:*`, `mapping_static:*`, `mapping_enrich:*`, `poll_once:*`, `db_iris:*`, `fallback_static:*`.
 - Hinweis: Die Debug-Endpunkte sind aktuell nicht authentifiziert und sollten nur in vertrauenswürdigen Netzen erreichbar sein.
 
