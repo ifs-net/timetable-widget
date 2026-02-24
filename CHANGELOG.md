@@ -8,6 +8,9 @@ Alle relevanten Ã„nderungen dieses Projekts werden hier dokumentiert.
 - Release-Pipeline fuer Synology-Update-Erkennung abgesichert: Docker-Buildx-Push ohne Attestations.
 - Docker Hub Push fuer `latest` und Versionstag erfolgt mit `--provenance=false` und `--sbom=false`.
 
+### Behoben
+- DB-API-Credentials werden fuer DB-IRIS jetzt zusaetzlich direkt aus `/config/.dbapikey` (oder `DB_APIKEY_FILE`) geladen.
+- Synology-Container ohne `env_file` koennen damit Bahnhof-Widgets wieder ohne "DB API credentials fehlen" ausliefern.
 
 ## [1.2.0] - 2026-02-24
 
@@ -71,4 +74,5 @@ Alle relevanten Ã„nderungen dieses Projekts werden hier dokumentiert.
 - HTML-Widget und JSON-Endpunkte pro Widget-ID.
 - On-Demand-Refresh mit Caching, Warmup-Optionen und Debug-Logging.
 - Statischer GTFS-Fallback inklusive Fahrtrichtungsermittlung.
+
 
