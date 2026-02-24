@@ -8,13 +8,14 @@ import io
 import json
 import logging
 import os
+import pickle
 import re
 import socket
 import threading
 import time
-import xml.etree.ElementTree as ET
 import zipfile
-from contextlib import asynccontextmanager
+from collections import deque
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -25,8 +26,31 @@ import httpx
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from google.transit import gtfs_realtime_pb2
+from providers_db_timetables import (
+    DBIrisEventChange as ProviderDBIrisEventChange,
+    fetch_db_timetables_departures,
+    parse_db_iris_fchg_changes as provider_parse_db_iris_fchg_changes,
+    parse_db_iris_plan_departures as provider_parse_db_iris_plan_departures,
+    parse_db_iris_timestamp as provider_parse_db_iris_timestamp,
+)
+from providers_gtfs_rt import (
+    fetch_feed_bytes as provider_fetch_feed_bytes,
+    load_static_gtfs_archive_bytes as provider_load_static_gtfs_archive_bytes,
+)
+from service_polling import (
+    PollingDeps,
+    ensure_data_fresh as service_ensure_data_fresh,
+    poll_once as service_poll_once,
+    run_startup_warmup as service_run_startup_warmup,
+)
+from web_views import (
+    render_logs_html as views_render_logs_html,
+    render_service_index_html as views_render_service_index_html,
+    render_widget_html as views_render_widget_html,
+    render_widget_index_html as views_render_widget_index_html,
+)
 
 
 CONFIG_PATH = os.getenv("CONFIG_PATH", "/config/config.yaml")
@@ -36,8 +60,34 @@ USER_AGENT = os.getenv(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
 )
+
+
+def load_app_version() -> str:
+    configured = os.getenv("APP_VERSION", "").strip()
+    if configured:
+        return configured
+
+    candidates = [
+        Path("/app/VERSION"),
+        Path(__file__).resolve().with_name("VERSION"),
+        Path.cwd() / "VERSION",
+    ]
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_file():
+                value = candidate.read_text(encoding="utf-8").strip()
+                if value:
+                    return value
+        except Exception:
+            continue
+    return "dev"
+
+
+APP_VERSION = load_app_version()
 GTFS_STATIC_URL = os.getenv("GTFS_STATIC_URL", "https://download.gtfs.de/germany/nv_free/latest.zip")
-GTFS_STATIC_CACHE_PATH = os.getenv("GTFS_STATIC_CACHE_PATH", "/tmp/nv_free_latest.zip")
+GTFS_STATIC_CACHE_PATH = os.getenv("GTFS_STATIC_CACHE_PATH", "/data/nv_free_latest.zip")
+STATIC_FALLBACK_INDEX_CACHE_PATH = os.getenv("STATIC_FALLBACK_INDEX_CACHE_PATH", "/data/static_fallback_index_cache.pkl")
+STATIC_FALLBACK_INDEX_CACHE_VERSION = 1
 try:
     GTFS_STATIC_CACHE_MAX_AGE_SECONDS = int(os.getenv("GTFS_STATIC_CACHE_MAX_AGE_SECONDS", "43200"))
 except ValueError:
@@ -92,7 +142,10 @@ def resolve_db_credentials() -> tuple[str, str]:
 
 DB_CLIENT_ID, DB_API_KEY = resolve_db_credentials()
 DEFAULT_DEBUG_LOG_PATH = "/logs/logfile.txt"
+DEFAULT_FALLBACK_LOG_PATH = "/tmp/timetable-widget/logfile.txt"
+LOG_TAIL_LINES = 300
 DEBUG_LOG_PATH = DEFAULT_DEBUG_LOG_PATH
+ACTIVE_LOG_PATH = DEFAULT_DEBUG_LOG_PATH
 WARMUP_ON_START = str(os.getenv("WARMUP_ON_START", "0")).strip().lower() in {"1", "true", "yes", "on"}
 WARMUP_STATIC_CACHE_ON_START = str(os.getenv("WARMUP_STATIC_CACHE_ON_START", "1")).strip().lower() in {"1", "true", "yes", "on"}
 LOCAL_TIMEZONE_NAME = os.getenv("LOCAL_TIMEZONE", "Europe/Berlin")
@@ -156,10 +209,32 @@ def _close_logger_handlers(logger: logging.Logger) -> None:
             pass
 
 
+def _prepare_writable_log_path(path: str) -> tuple[Optional[Path], Optional[str]]:
+    preferred = Path(path)
+    candidates = [preferred]
+    fallback = Path(DEFAULT_FALLBACK_LOG_PATH)
+    if fallback != preferred:
+        candidates.append(fallback)
+
+    errors: list[str] = []
+    for target in candidates:
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.touch()
+            if target != preferred:
+                return target, f"Primaerer Logpfad nicht schreibbar ({preferred}). Nutze Fallback {target}."
+            return target, None
+        except Exception as exc:
+            errors.append(f"{target}: {exc}")
+    return None, f"Logdatei konnte nicht vorbereitet werden: {' | '.join(errors)}"
+
+
 def configure_debug_logger(enabled: bool, log_path: Optional[str] = None) -> tuple[bool, str]:
     global DEBUG_ENABLED
     global DEBUG_LOGGER
     global DEBUG_LOG_PATH
+    global ACTIVE_LOG_PATH
 
     with DEBUG_LOGGER_LOCK:
         if log_path is not None:
@@ -167,38 +242,52 @@ def configure_debug_logger(enabled: bool, log_path: Optional[str] = None) -> tup
             if candidate:
                 DEBUG_LOG_PATH = candidate
         if not DEBUG_LOG_PATH:
-            DEBUG_LOG_PATH = "/logs/logfile.txt"
+            DEBUG_LOG_PATH = DEFAULT_DEBUG_LOG_PATH
 
         logger = logging.getLogger("timetable_widget_debug")
         logger.setLevel(logging.INFO)
         logger.propagate = False
 
-        if not enabled:
+        resolved_path, path_warning = _prepare_writable_log_path(DEBUG_LOG_PATH)
+        if resolved_path is None:
             _close_logger_handlers(logger)
             DEBUG_LOGGER = None
             DEBUG_ENABLED = False
-            return False, "Debug-Modus deaktiviert."
+            ACTIVE_LOG_PATH = DEBUG_LOG_PATH
+            return False, path_warning or "Debug-Modus konnte nicht aktiviert werden."
 
         try:
-            resolved_path = Path(DEBUG_LOG_PATH)
-            resolved_path.parent.mkdir(parents=True, exist_ok=True)
             _close_logger_handlers(logger)
             handler = logging.FileHandler(resolved_path, encoding="utf-8")
             handler.setFormatter(
                 logging.Formatter(
-                    f"%(asctime)s %(levelname)s [host={INSTANCE_HOSTNAME} ip={INSTANCE_IP}] %(message)s"
+                    "%(asctime)s %(levelname)s [host=%(hostname)s ip=%(instance_ip)s] %(message)s"
                 )
             )
             logger.addHandler(handler)
-            logger.info("Debug mode enabled. Log path: %s", resolved_path)
-            DEBUG_LOGGER = logger
-            DEBUG_ENABLED = True
-            return True, f"Debug-Modus aktiviert. Log-Datei: {resolved_path}"
+            adapter = logging.LoggerAdapter(
+                logger,
+                {
+                    "hostname": INSTANCE_HOSTNAME,
+                    "instance_ip": INSTANCE_IP,
+                },
+            )
+            ACTIVE_LOG_PATH = str(resolved_path)
+            DEBUG_LOGGER = adapter
+            DEBUG_ENABLED = enabled
+            if path_warning:
+                adapter.warning(path_warning)
+            if enabled:
+                adapter.info("Debug-Modus aktiviert. Log-Datei: %s", resolved_path)
+                return True, f"Debug-Modus aktiviert. Log-Datei: {resolved_path}"
+            adapter.info("Debug-Modus deaktiviert. Basis-Logging bleibt aktiv. Log-Datei: %s", resolved_path)
+            return True, f"Debug-Modus deaktiviert. Basis-Logging aktiv. Log-Datei: {resolved_path}"
         except Exception as exc:
             _close_logger_handlers(logger)
             DEBUG_LOGGER = None
             DEBUG_ENABLED = False
-            return False, f"Debug-Modus konnte nicht aktiviert werden: {exc}"
+            ACTIVE_LOG_PATH = DEBUG_LOG_PATH
+            return False, f"Logging konnte nicht konfiguriert werden: {exc}"
 
 
 def get_debug_status() -> dict:
@@ -206,6 +295,7 @@ def get_debug_status() -> dict:
         return {
             "enabled": DEBUG_ENABLED,
             "log_path": DEBUG_LOG_PATH,
+            "active_log_path": ACTIVE_LOG_PATH,
             "active_logger": DEBUG_LOGGER is not None,
             "instance_host": INSTANCE_HOSTNAME,
             "instance_ip": INSTANCE_IP,
@@ -215,10 +305,18 @@ def get_debug_status() -> dict:
 configure_debug_logger(False, DEBUG_LOG_PATH)
 
 
-def debug_log(message: str) -> None:
+def app_log(message: str) -> None:
     logger = DEBUG_LOGGER
     if logger:
         logger.info(message)
+
+
+def debug_log(message: str) -> None:
+    if not DEBUG_ENABLED:
+        return
+    logger = DEBUG_LOGGER
+    if logger:
+        logger.info("[DEBUG] %s", message)
 
 
 def _normalize_direction_mapping_value(value: str) -> str:
@@ -439,18 +537,6 @@ async def register_observed_direction_entries(
     )
 
 
-def build_db_timetables_headers(client_id: str, api_key: str) -> dict[str, str]:
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/xml",
-    }
-    if client_id:
-        headers["DB-Client-Id"] = client_id
-    if api_key:
-        headers["DB-Api-Key"] = api_key
-    return headers
-
-
 @dataclass
 class ServerConfig:
     host: str
@@ -571,6 +657,10 @@ class RuntimeState:
         default_factory=dict
     )
     refresh_task: Optional[asyncio.Task] = None
+    startup_task: Optional[asyncio.Task] = None
+    startup_ready: bool = False
+    startup_error: Optional[str] = None
+    startup_ready_since_epoch: Optional[int] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -860,13 +950,21 @@ def load_trip_route_map_from_static_gtfs(
     )
 
     download_started = time.monotonic()
+    app_log(
+        f"external_fetch:start source=gtfs_static purpose=mapping_fallback url={GTFS_STATIC_URL} timeout_s={timeout_seconds}"
+    )
     try:
         response = httpx.get(GTFS_STATIC_URL, timeout=timeout_seconds, headers={"User-Agent": USER_AGENT})
         response.raise_for_status()
     except Exception as exc:
+        app_log(f"external_fetch:error source=gtfs_static purpose=mapping_fallback error={exc}")
         debug_log(f"mapping_fallback:download_failed error={exc}")
         return {}, {}, f"mapping fallback download failed: {exc}"
     download_elapsed = time.monotonic() - download_started
+    app_log(
+        "external_fetch:ok "
+        f"source=gtfs_static purpose=mapping_fallback status={response.status_code} bytes={len(response.content)} duration_s={download_elapsed:.2f}"
+    )
     debug_log(
         f"mapping_fallback:download_ok bytes={len(response.content)} duration_s={download_elapsed:.2f}"
     )
@@ -1049,122 +1147,15 @@ def _matches_widget_text_filters(
     return True
 
 
-@dataclass
-class DBIrisEventChange:
-    tl: dict[str, str] = field(default_factory=dict)
-    ar: dict[str, str] = field(default_factory=dict)
-    dp: dict[str, str] = field(default_factory=dict)
-    message_types: set[str] = field(default_factory=set)
+DBIrisEventChange = ProviderDBIrisEventChange
 
 
 def parse_db_iris_timestamp(raw_value: str) -> Optional[int]:
-    text = str(raw_value or "").strip()
-    if len(text) != 10:
-        return None
-    try:
-        dt_local = datetime.strptime(text, "%y%m%d%H%M").replace(tzinfo=LOCAL_TIMEZONE)
-    except ValueError:
-        return None
-    return int(dt_local.timestamp())
-
-
-def _is_db_train_departure(route: str, category: str, train_number: str) -> bool:
-    line = str(route or "").strip().upper().replace(" ", "")
-    cat = str(category or "").strip().upper()
-    train_no = str(train_number or "").strip()
-
-    explicit_line_prefixes = (
-        "ICE",
-        "IC",
-        "EC",
-        "ECE",
-        "RJX",
-        "RJ",
-        "EN",
-        "NJ",
-        "RE",
-        "RB",
-        "IRE",
-        "IR",
-        "FLX",
-        "ALX",
-        "MEX",
-        "MRB",
-        "ERB",
-        "TLX",
-        "TL",
-        "DPN",
-        "ABR",
-        "HEX",
-        "ME",
-    )
-    if line.startswith(explicit_line_prefixes):
-        return True
-    if re.match(r"^S\d", line):
-        return True
-    if re.match(r"^U\d", line):
-        return True
-
-    explicit_categories = {
-        "ICE",
-        "IC",
-        "EC",
-        "ECE",
-        "RJ",
-        "RJX",
-        "EN",
-        "NJ",
-        "RE",
-        "RB",
-        "IRE",
-        "IR",
-        "S",
-        "U",
-        "FLX",
-        "ALX",
-        "MEX",
-        "TL",
-        "TLX",
-        "AG",
-    }
-    if cat in explicit_categories:
-        return True
-    if cat in {"BUS", "SEV", "TRAM", "STR"}:
-        return False
-
-    if train_no and cat and cat not in {"BUS", "SEV", "TRAM", "STR"}:
-        return True
-
-    return False
+    return provider_parse_db_iris_timestamp(raw_value, local_timezone=LOCAL_TIMEZONE)
 
 
 def parse_db_iris_fchg_changes(payload: bytes) -> dict[str, DBIrisEventChange]:
-    try:
-        root = ET.fromstring(payload)
-    except ET.ParseError as exc:
-        raise ValueError(f"DB-IRIS fchg XML parse failed: {exc}") from exc
-
-    changes: dict[str, DBIrisEventChange] = {}
-    for stop_event in root.findall("s"):
-        event_id = str(stop_event.attrib.get("id", "")).strip()
-        if not event_id:
-            continue
-        change = DBIrisEventChange()
-        tl_node = stop_event.find("tl")
-        ar_node = stop_event.find("ar")
-        dp_node = stop_event.find("dp")
-        if tl_node is not None:
-            change.tl.update({str(k): str(v) for k, v in tl_node.attrib.items()})
-        if ar_node is not None:
-            change.ar.update({str(k): str(v) for k, v in ar_node.attrib.items()})
-        if dp_node is not None:
-            change.dp.update({str(k): str(v) for k, v in dp_node.attrib.items()})
-        for message_node in stop_event.findall("m"):
-            msg_type = str(message_node.attrib.get("t", "")).strip().lower()
-            if msg_type:
-                change.message_types.add(msg_type)
-        changes[event_id] = change
-    return changes
+    return provider_parse_db_iris_fchg_changes(payload)
 
 
 def parse_db_iris_plan_departures(
@@ -1173,180 +1164,35 @@ def parse_db_iris_plan_departures(
     now_epoch: int,
     changes_by_event_id: Optional[dict[str, DBIrisEventChange]] = None,
 ) -> list[Departure]:
-    departures: list[Departure] = []
-    try:
-        root = ET.fromstring(payload)
-    except ET.ParseError as exc:
-        raise ValueError(f"DB-IRIS XML parse failed: {exc}") from exc
-
-    route_filter = set(widget.route_short_names or [])
-    for stop_event in root.findall("s"):
-        event_id = str(stop_event.attrib.get("id", "")).strip()
-        departure_node = stop_event.find("dp")
-        arrival_node = stop_event.find("ar")
-        train_node = stop_event.find("tl")
-        if departure_node is None:
-            continue
-
-        change = (changes_by_event_id or {}).get(event_id)
-        train_attrs = dict(train_node.attrib) if train_node is not None else {}
-        departure_attrs = dict(departure_node.attrib)
-        arrival_attrs = dict(arrival_node.attrib) if arrival_node is not None else {}
-        if change:
-            train_attrs.update(change.tl)
-            departure_attrs.update(change.dp)
-            arrival_attrs.update(change.ar)
-
-        cancel_state = str(departure_attrs.get("cs") or arrival_attrs.get("cs") or "").strip().lower()
-        if cancel_state == "c":
-            continue
-        if change and "c" in change.message_types:
-            continue
-
-        planned_epoch = parse_db_iris_timestamp(departure_attrs.get("pt", "") or arrival_attrs.get("pt", ""))
-        changed_epoch = parse_db_iris_timestamp(departure_attrs.get("ct", "") or arrival_attrs.get("ct", ""))
-        time_epoch = changed_epoch or planned_epoch
-        if time_epoch is None or time_epoch < now_epoch:
-            continue
-
-        route = str(departure_attrs.get("l", "") or arrival_attrs.get("l", "")).strip()
-        if not route:
-            route = str(train_attrs.get("c", "")).strip()
-        if not route:
-            route = str(train_attrs.get("n", "")).strip()
-
-        if widget.db_only_trains and not _is_db_train_departure(
-            route,
-            str(train_attrs.get("c", "")),
-            str(train_attrs.get("n", "")),
-        ):
-            continue
-        if route_filter:
-            if not route or route not in route_filter:
-                continue
-
-        path_text = str(
-            departure_attrs.get("cpth")
-            or departure_attrs.get("ppth")
-            or arrival_attrs.get("cpth")
-            or arrival_attrs.get("ppth")
-            or ""
-        )
-        path_stops = [part.strip() for part in path_text.split("|") if part.strip()]
-        direction = path_stops[0] if path_stops else ""
-        if not _matches_widget_text_filters(widget, direction, path_stops):
-            continue
-
-        platform = str(
-            departure_attrs.get("cp")
-            or departure_attrs.get("pp")
-            or arrival_attrs.get("cp")
-            or arrival_attrs.get("pp")
-            or ""
-        ).strip() or None
-
-        delay_s: Optional[int] = None
-        if widget.show_delay and planned_epoch is not None and changed_epoch is not None:
-            delay_s = changed_epoch - planned_epoch
-        in_min = max(0, int((time_epoch - now_epoch) // 60))
-        departures.append(
-            Departure(
-                route=route,
-                direction=direction,
-                platform=platform,
-                stop_id=str(stop_event.attrib.get("eva", widget.db_eva_no or "")).strip(),
-                time_epoch=time_epoch,
-                time_local=to_local_datetime(time_epoch).strftime("%H:%M"),
-                in_min=in_min,
-                delay_s=delay_s,
-                trip_id=event_id,
-            )
-        )
-
-    departures.sort(key=lambda item: item.time_epoch)
-    return departures
+    return provider_parse_db_iris_plan_departures(
+        widget,
+        payload,
+        now_epoch,
+        local_timezone=LOCAL_TIMEZONE,
+        to_local_datetime_fn=to_local_datetime,
+        match_widget_text_filters_fn=_matches_widget_text_filters,
+        departure_factory=Departure,
+        changes_by_event_id=changes_by_event_id,
+    )
 
 
 async def fetch_db_iris_departures(widget: WidgetConfig, timeout_seconds: int, now_epoch: int) -> list[Departure]:
-    started_at = time.monotonic()
-    eva_no = str(widget.db_eva_no or "").strip()
-    if not eva_no:
-        raise ValueError(f"Widget {widget.id}: db_eva_no fehlt.")
-
-    now_local = to_local_datetime(now_epoch).replace(minute=0, second=0, microsecond=0)
-    merged: list[Departure] = []
-    client_id, api_key = resolve_db_credentials()
-    if not client_id or not api_key:
-        raise ValueError(
-            "DB API credentials fehlen. Setze DB_CLIENT_ID und DB_API_KEY als Environment-Variablen "
-            "oder lege sie in /config/.dbapikey (bzw. DB_APIKEY_FILE) ab."
-        )
-
-    debug_log(
-        f"db_iris:fetch_start widget={widget.id} eva={eva_no} lookahead_h={widget.db_lookahead_hours}"
+    return await fetch_db_timetables_departures(
+        widget,
+        timeout_seconds,
+        now_epoch,
+        resolve_db_credentials_fn=resolve_db_credentials,
+        base_url=DB_TIMETABLES_BASE_URL,
+        user_agent=USER_AGENT,
+        local_timezone=LOCAL_TIMEZONE,
+        app_log_fn=app_log,
+        debug_log_fn=debug_log,
+        to_local_datetime_fn=to_local_datetime,
+        match_widget_text_filters_fn=_matches_widget_text_filters,
+        departure_factory=Departure,
     )
 
-    async with httpx.AsyncClient(timeout=timeout_seconds, headers=build_db_timetables_headers(client_id, api_key)) as client:
-        changes_by_event_id: dict[str, DBIrisEventChange] = {}
-        if widget.db_use_fchg:
-            fchg_started = time.monotonic()
-            try:
-                fchg_url = f"{DB_TIMETABLES_BASE_URL}/fchg/{eva_no}"
-                fchg_response = await client.get(fchg_url)
-                fchg_response.raise_for_status()
-                changes_by_event_id = parse_db_iris_fchg_changes(fchg_response.content)
-                debug_log(
-                    "db_iris:fchg_ok "
-                    f"widget={widget.id} changes={len(changes_by_event_id)} duration_s={time.monotonic() - fchg_started:.2f}"
-                )
-            except Exception as exc:
-                debug_log(f"db_iris:fchg_unavailable widget={widget.id} error={exc}")
 
-        requested_plan_requests = 0
-        successful_plan_requests = 0
-        not_found_plan_requests = 0
-        for offset in range(widget.db_lookahead_hours):
-            slot = now_local + timedelta(hours=offset)
-            date_token = slot.strftime("%y%m%d")
-            hour_token = slot.strftime("%H")
-            url = f"{DB_TIMETABLES_BASE_URL}/plan/{eva_no}/{date_token}/{hour_token}"
-            slot_started = time.monotonic()
-            requested_plan_requests += 1
-            try:
-                response = await client.get(url)
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == 404:
-                    # Some stations/hours have no dataset chunk; skip instead of failing whole widget.
-                    not_found_plan_requests += 1
-                    continue
-                raise
-            successful_plan_requests += 1
-            parsed_slot_departures = parse_db_iris_plan_departures(widget, response.content, now_epoch, changes_by_event_id)
-            merged.extend(parsed_slot_departures)
-            debug_log(
-                "db_iris:plan_slot_ok "
-                f"widget={widget.id} slot={date_token}{hour_token} departures={len(parsed_slot_departures)} "
-                f"duration_s={time.monotonic() - slot_started:.2f}"
-            )
-            if len(merged) >= widget.max_departures:
-                break
-
-        if successful_plan_requests == 0:
-            raise ValueError(f"DB-IRIS plan returned no available time slices for EVA {eva_no}.")
-
-    merged.sort(key=lambda item: item.time_epoch)
-    dedup: dict[tuple[str, int, str], Departure] = {}
-    for item in merged:
-        dedup[(item.trip_id, item.time_epoch, item.route)] = item
-    result = list(sorted(dedup.values(), key=lambda item: item.time_epoch))[: widget.max_departures]
-    debug_log(
-        "db_iris:fetch_done "
-        f"widget={widget.id} eva={eva_no} requested={requested_plan_requests} ok={successful_plan_requests} "
-        f"not_found={not_found_plan_requests} merged={len(merged)} deduped={len(dedup)} result={len(result)} "
-        f"duration_s={time.monotonic() - started_at:.2f}"
-    )
-    return result
 def extract_departures(
     feed_message: gtfs_realtime_pb2.FeedMessage,
     widget: WidgetConfig,
@@ -1410,52 +1256,15 @@ def extract_departures(
 
 
 def load_static_gtfs_archive_bytes(timeout_seconds: int) -> tuple[Optional[bytes], Optional[str]]:
-    cache_path = Path(GTFS_STATIC_CACHE_PATH)
-    now_epoch = time.time()
-
-    if cache_path.is_file():
-        try:
-            age_s = max(0, int(now_epoch - cache_path.stat().st_mtime))
-        except OSError:
-            age_s = GTFS_STATIC_CACHE_MAX_AGE_SECONDS + 1
-        if age_s <= GTFS_STATIC_CACHE_MAX_AGE_SECONDS:
-            try:
-                payload = cache_path.read_bytes()
-                debug_log(
-                    f"mapping_static:cache_hit path={cache_path} bytes={len(payload)} age_s={age_s}"
-                )
-                return payload, None
-            except Exception as exc:
-                debug_log(f"mapping_static:cache_read_failed path={cache_path} error={exc}")
-
-    download_started = time.monotonic()
-    try:
-        response = httpx.get(GTFS_STATIC_URL, timeout=timeout_seconds, headers={"User-Agent": USER_AGENT})
-        response.raise_for_status()
-        payload = response.content
-        debug_log(
-            "mapping_static:download_ok "
-            f"url={GTFS_STATIC_URL} bytes={len(payload)} duration_s={time.monotonic() - download_started:.2f}"
-        )
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_bytes(payload)
-            debug_log(f"mapping_static:cache_write_ok path={cache_path} bytes={len(payload)}")
-        except Exception as exc:
-            debug_log(f"mapping_static:cache_write_failed path={cache_path} error={exc}")
-        return payload, None
-    except Exception as exc:
-        debug_log(f"mapping_static:download_failed error={exc}")
-        if cache_path.is_file():
-            try:
-                payload = cache_path.read_bytes()
-                debug_log(
-                    f"mapping_static:stale_cache_used path={cache_path} bytes={len(payload)}"
-                )
-                return payload, None
-            except Exception as cache_exc:
-                debug_log(f"mapping_static:stale_cache_read_failed path={cache_path} error={cache_exc}")
-        return None, f"mapping static download failed: {exc}"
+    return provider_load_static_gtfs_archive_bytes(
+        timeout_seconds,
+        static_url=GTFS_STATIC_URL,
+        cache_path=GTFS_STATIC_CACHE_PATH,
+        cache_max_age_seconds=GTFS_STATIC_CACHE_MAX_AGE_SECONDS,
+        user_agent=USER_AGENT,
+        app_log_fn=app_log,
+        debug_log_fn=debug_log,
+    )
 
 
 def load_known_stop_ids_from_static_gtfs(timeout_seconds: int) -> tuple[set[str], Optional[str]]:
@@ -1501,11 +1310,82 @@ def _parse_gtfs_hms_to_seconds(raw_value: str) -> Optional[int]:
     return hours * 3600 + minutes * 60 + seconds
 
 
+
+def _static_archive_cache_token() -> str:
+    cache_path = Path(GTFS_STATIC_CACHE_PATH)
+    if not cache_path.is_file():
+        return ""
+    try:
+        stat = cache_path.stat()
+    except OSError:
+        return ""
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _load_static_fallback_index_cache(cache_token: str, stop_ids: set[str]) -> Optional[StaticFallbackIndex]:
+    if not cache_token:
+        return None
+
+    target_path = Path(STATIC_FALLBACK_INDEX_CACHE_PATH)
+    if not target_path.is_file():
+        return None
+
+    expected_stop_ids = tuple(sorted(stop_ids))
+    try:
+        with target_path.open("rb") as handle:
+            payload = pickle.load(handle)
+    except Exception as exc:
+        debug_log(f"fallback_static:cache_read_failed path={target_path} error={exc}")
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != STATIC_FALLBACK_INDEX_CACHE_VERSION:
+        return None
+    if payload.get("cache_token") != cache_token:
+        return None
+    if tuple(payload.get("stop_ids") or ()) != expected_stop_ids:
+        return None
+
+    index = payload.get("index")
+    if not isinstance(index, StaticFallbackIndex):
+        return None
+
+    app_log(
+        "perf:fallback_index_cache_hit "
+        f"path={target_path} stop_ids={len(expected_stop_ids)}"
+    )
+    return index
+
+
+def _save_static_fallback_index_cache(cache_token: str, stop_ids: set[str], index: StaticFallbackIndex) -> None:
+    if not cache_token:
+        return
+
+    target_path = Path(STATIC_FALLBACK_INDEX_CACHE_PATH)
+    payload = {
+        "version": STATIC_FALLBACK_INDEX_CACHE_VERSION,
+        "cache_token": cache_token,
+        "stop_ids": tuple(sorted(stop_ids)),
+        "index": index,
+    }
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with target_path.open("wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:
+        debug_log(f"fallback_static:cache_write_failed path={target_path} error={exc}")
+
 def load_static_fallback_index_for_stop_ids(
     stop_ids: list[str], timeout_seconds: int
 ) -> tuple[Optional[StaticFallbackIndex], Optional[str]]:
     started_at = time.monotonic()
     target_stop_ids = {stop_id.strip() for stop_id in stop_ids if stop_id.strip()}
+    cpu_started_at = time.process_time()
+    app_log(
+        "perf:fallback_index_build_start "
+        f"stop_ids={len(target_stop_ids)} timeout_s={timeout_seconds}"
+    )
     empty_index = StaticFallbackIndex(
         stop_entries={},
         trip_route={},
@@ -1523,6 +1403,16 @@ def load_static_fallback_index_for_stop_ids(
     payload, load_error = load_static_gtfs_archive_bytes(timeout_seconds)
     if payload is None:
         return None, load_error or "static fallback payload unavailable"
+
+    cache_token = _static_archive_cache_token() or f"memory:{len(payload)}"
+    cached_index = _load_static_fallback_index_cache(cache_token, target_stop_ids)
+    if cached_index is not None:
+        app_log(
+            "perf:fallback_index_build_done "
+            f"stop_ids={len(target_stop_ids)} entries={sum(len(items) for items in cached_index.stop_entries.values())} "
+            f"wall_s={time.monotonic() - started_at:.2f} cpu_s={time.process_time() - cpu_started_at:.2f} cache_hit=1"
+        )
+        return cached_index, None
 
     try:
         with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
@@ -1797,6 +1687,12 @@ def load_static_fallback_index_for_stop_ids(
                 f"stop_times_s={stop_times_elapsed:.2f} trips_s={trips_elapsed:.2f} routes_s={routes_elapsed:.2f} "
                 f"stops_lookup_s={stops_lookup_elapsed:.2f} calendar_s={calendar_elapsed:.2f} "
                 f"calendar_dates_s={calendar_dates_elapsed:.2f} total_s={time.monotonic() - started_at:.2f}"
+            )
+            _save_static_fallback_index_cache(cache_token, target_stop_ids, index)
+            app_log(
+                "perf:fallback_index_build_done "
+                f"stop_ids={len(target_stop_ids)} entries={total_entries} wall_s={time.monotonic() - started_at:.2f} "
+                f"cpu_s={time.process_time() - cpu_started_at:.2f} cache_hit=0"
             )
             return index, None
     except Exception as exc:
@@ -2126,13 +2022,12 @@ def load_trip_maps_for_trip_ids_from_static_gtfs(
         debug_log(f"mapping_enrich:failed error={exc}")
         return {}, {}, f"mapping enrich parse failed: {exc}"
 async def fetch_feed_bytes(url: str, timeout_seconds: int) -> bytes:
-    if not url:
-        raise ValueError("feed.url is empty")
-    headers = {"User-Agent": USER_AGENT}
-    async with httpx.AsyncClient(timeout=timeout_seconds, headers=headers) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-        return response.content
+    return await provider_fetch_feed_bytes(
+        url,
+        timeout_seconds,
+        user_agent=USER_AGENT,
+        app_log_fn=app_log,
+    )
 
 
 def age_seconds(fetched_at_epoch: Optional[int]) -> Optional[int]:
@@ -2152,266 +2047,62 @@ async def reload_mapping_if_due(state: RuntimeState) -> None:
     reload_in_seconds = state.config.mapping.reload_every_seconds
 
     async with state.lock:
+        had_existing_mapping = bool(state.route_map) or bool(state.trip_destination_map)
+        if had_existing_mapping and not route_map and not trip_destination_map:
+            # Keep in-memory mapping if file reload fails/returns empty to avoid repeated expensive re-enrichment.
+            route_map = dict(state.route_map)
+            trip_destination_map = dict(state.trip_destination_map)
+            if mapping_error:
+                mapping_error = f"{mapping_error} | Mapping-Reuse aus Arbeitsspeicher aktiv"
+            else:
+                mapping_error = "Mapping-Datei leer/nicht verfuegbar; verwende Mapping aus Arbeitsspeicher"
+            app_log(
+                "mapping_reload:memory_reuse "
+                f"path={state.config.mapping.trip_route_map_csv} routes={len(route_map)} destinations={len(trip_destination_map)}"
+            )
+
         state.route_map = route_map
         state.trip_destination_map = trip_destination_map
         state.mapping_error = mapping_error
         state.next_mapping_reload_monotonic = now_monotonic + reload_in_seconds
+
     debug_log(
         "mapping_reload:finished "
         f"routes={len(route_map)} destinations={len(trip_destination_map)} error={bool(mapping_error)} "
         f"next_in_s={reload_in_seconds} duration_s={time.monotonic() - started_at:.2f}"
     )
 
-async def poll_once(state: RuntimeState) -> None:
-    started_at = time.monotonic()
-    debug_log("poll_once:started")
-    if not state.config.widgets:
-        async with state.lock:
-            state.errors_by_widget = {}
-            state.departures_by_widget = {}
-            state.extended_departures_cache = {}
-            state.next_refresh_due_monotonic = time.monotonic() + state.config.feed.refresh_seconds
-        debug_log("poll_once:widgets_empty")
-        return
 
-    now_epoch = int(time.time())
-    gtfs_widgets = [widget for widget in state.config.widgets if widget.source == "gtfs_rt"]
-    db_widgets = [widget for widget in state.config.widgets if widget.source == "db_iris"]
-
-    await refresh_direction_mapping_if_due(state)
-    async with state.lock:
-        direction_labels = dict(state.direction_labels)
-        direction_label_patterns = list(state.direction_label_patterns)
-        direction_label_patterns = list(state.direction_label_patterns)
-        direction_label_patterns = list(state.direction_label_patterns)
-
-    observed_direction_entries: dict[tuple[str, str], tuple[str, str]] = {}
-
-    route_map: dict[str, str] = {}
-    trip_destination_map: dict[str, str] = {}
-    mapping_error: Optional[str] = None
-    if gtfs_widgets:
-        mapping_stage_started = time.monotonic()
-        await reload_mapping_if_due(state)
-        async with state.lock:
-            route_map = dict(state.route_map)
-            trip_destination_map = dict(state.trip_destination_map)
-            mapping_error = state.mapping_error
-        debug_log(
-            "poll_once:mapping_ready "
-            f"routes={len(route_map)} destinations={len(trip_destination_map)} "
-            f"has_error={bool(mapping_error)} duration_s={time.monotonic() - mapping_stage_started:.2f}"
-        )
-
-    departures_by_widget: dict[str, list[Departure]] = {widget.id: [] for widget in state.config.widgets}
-    errors_by_widget: dict[str, list[str]] = {widget.id: [] for widget in state.config.widgets}
-    total_departures = 0
-
-    if gtfs_widgets:
-        try:
-            feed_fetch_started = time.monotonic()
-            feed_bytes = await fetch_feed_bytes(state.config.feed.url, state.config.feed.http_timeout_seconds)
-            feed_fetch_elapsed = time.monotonic() - feed_fetch_started
-
-            parse_started = time.monotonic()
-            feed_message = gtfs_realtime_pb2.FeedMessage()
-            feed_message.ParseFromString(feed_bytes)
-            parse_elapsed = time.monotonic() - parse_started
-
-            configured_stop_ids = set(all_widget_stop_ids(state.config, source="gtfs_rt"))
-            await refresh_known_stop_ids_if_due(state)
-            async with state.lock:
-                known_stop_ids = set(state.known_stop_ids)
-                known_stop_ids_error = state.known_stop_ids_error
-            debug_log(
-                "poll_once:gtfs_feed_ready "
-                f"bytes={len(feed_bytes)} entities={len(feed_message.entity)} known_stop_ids={len(known_stop_ids)} "
-                f"fetch_s={feed_fetch_elapsed:.2f} parse_s={parse_elapsed:.2f}"
-            )
-
-            enrich_started = time.monotonic()
-            relevant_trip_ids, relevant_last_stops = collect_realtime_trip_context(feed_message, configured_stop_ids)
-            missing_route_trip_ids = {trip_id for trip_id in relevant_trip_ids if trip_id not in route_map}
-            missing_destination_trip_ids = {trip_id for trip_id in relevant_trip_ids if trip_id not in trip_destination_map}
-            if missing_route_trip_ids or missing_destination_trip_ids:
-                enrich_route_map, enrich_destination_map, enrich_error = await asyncio.to_thread(
-                    load_trip_maps_for_trip_ids_from_static_gtfs,
-                    relevant_trip_ids,
-                    relevant_last_stops,
-                    max(30, state.config.feed.http_timeout_seconds * 4),
-                )
-                added_routes = 0
-                added_destinations = 0
-                for trip_id, line in enrich_route_map.items():
-                    if trip_id not in route_map and line:
-                        route_map[trip_id] = line
-                        added_routes += 1
-                for trip_id, direction in enrich_destination_map.items():
-                    if trip_id not in trip_destination_map and direction:
-                        trip_destination_map[trip_id] = direction
-                        added_destinations += 1
-
-                if added_routes or added_destinations:
-                    try:
-                        persist_trip_maps_to_csv(state.config.mapping.trip_route_map_csv, route_map, trip_destination_map)
-                        debug_log(
-                            "poll_once:mapping_persisted "
-                            f"path={state.config.mapping.trip_route_map_csv} routes={len(route_map)} "
-                            f"destinations={len(trip_destination_map)}"
-                        )
-                    except Exception as exc:
-                        debug_log(f"poll_once:mapping_persist_failed error={exc}")
-                    async with state.lock:
-                        state.route_map = dict(route_map)
-                        state.trip_destination_map = dict(trip_destination_map)
-
-                if enrich_error:
-                    mapping_error = f"{mapping_error} | {enrich_error}" if mapping_error else enrich_error
-
-                debug_log(
-                    "poll_once:mapping_enriched "
-                    f"relevant_trips={len(relevant_trip_ids)} missing_routes={len(missing_route_trip_ids)} "
-                    f"missing_destinations={len(missing_destination_trip_ids)} added_routes={added_routes} "
-                    f"added_destinations={added_destinations} duration_s={time.monotonic() - enrich_started:.2f}"
-                )
-            else:
-                debug_log(
-                    "poll_once:mapping_enriched "
-                    f"relevant_trips={len(relevant_trip_ids)} missing_routes=0 missing_destinations=0 "
-                    f"duration_s={time.monotonic() - enrich_started:.2f}"
-                )
-
-            static_fallback_index: Optional[StaticFallbackIndex] = None
-            static_fallback_error: Optional[str] = None
-            static_fallback_loaded = False
-
-            for widget in gtfs_widgets:
-                widget_started = time.monotonic()
-                widget_errors = errors_by_widget[widget.id]
-                if mapping_error:
-                    widget_errors.append(mapping_error)
-                if not widget.stop_ids:
-                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer mÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¶glich.")
-                if widget.route_short_names and not route_map:
-                    widget_errors.append(
-                        f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar."
-                    )
-                if not known_stop_ids and known_stop_ids_error:
-                    widget_errors.append(f"Stop-ID-Validierung aktuell nicht verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar: {known_stop_ids_error}")
-                for stop_id in widget.stop_ids:
-                    if known_stop_ids and stop_id not in known_stop_ids:
-                        widget_errors.append(f"Falsche Konfiguration: Stop-ID {stop_id} nicht gefunden.")
-
-                departures = extract_departures(feed_message, widget, route_map, trip_destination_map, now_epoch)
-                realtime_count = len(departures)
-
-                if realtime_count < widget.max_departures and widget.stop_ids:
-                    if not static_fallback_loaded:
-                        await refresh_static_fallback_index_if_due(state)
-                        async with state.lock:
-                            static_fallback_index = state.static_fallback_index
-                            static_fallback_error = state.static_fallback_error
-                        static_fallback_loaded = True
-
-                    if static_fallback_index is not None:
-                        fallback_departures = extract_static_schedule_departures(widget, static_fallback_index, now_epoch)
-                        departures = merge_departures_realtime_with_fallback(
-                            departures,
-                            fallback_departures,
-                            widget.max_departures,
-                        )
-                        debug_log(
-                            "poll_once:gtfs_fallback "
-                            f"widget={widget.id} realtime={realtime_count} fallback_candidates={len(fallback_departures)} "
-                            f"merged={len(departures)}"
-                        )
-                    elif static_fallback_error and realtime_count == 0:
-                        widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar: {static_fallback_error}")
-
-                observed_direction_entries.update(apply_direction_labels(departures, direction_labels, direction_label_patterns))
-                departures_by_widget[widget.id] = departures
-                total_departures += len(departures)
-                debug_log(
-                    "poll_once:gtfs_widget_done "
-                    f"widget={widget.id} departures={len(departures)} errors={len(widget_errors)} "
-                    f"duration_s={time.monotonic() - widget_started:.2f}"
-                )
-        except Exception as exc:
-            for widget in gtfs_widgets:
-                errors_by_widget[widget.id].append(f"GTFS feed fetch failed: {exc}")
-            debug_log(f"poll_once:gtfs_fetch_error error={exc}")
-
-    for widget in db_widgets:
-        widget_started = time.monotonic()
-        if not widget.db_eva_no:
-            errors_by_widget[widget.id].append(f"Widget {widget.id}: db_eva_no fehlt.")
-            continue
-        try:
-            departures = await fetch_db_iris_departures(widget, state.config.feed.http_timeout_seconds, now_epoch)
-            observed_direction_entries.update(apply_direction_labels(departures, direction_labels, direction_label_patterns))
-            departures_by_widget[widget.id] = departures
-            total_departures += len(departures)
-            debug_log(
-                "poll_once:db_widget_done "
-                f"widget={widget.id} departures={len(departures)} duration_s={time.monotonic() - widget_started:.2f}"
-            )
-        except Exception as exc:
-            errors_by_widget[widget.id].append(f"DB-IRIS Abruf fehlgeschlagen: {exc}")
-            debug_log(f"poll_once:db_iris_error widget={widget.id} error={exc}")
-
-    await register_observed_direction_entries(state, observed_direction_entries)
-
-    async with state.lock:
-        state.departures_by_widget = departures_by_widget
-        state.fetched_at_epoch = now_epoch
-        state.errors_by_widget = errors_by_widget
-        state.extended_departures_cache = {}
-        state.next_refresh_due_monotonic = time.monotonic() + state.config.feed.refresh_seconds
-    debug_log(
-        "poll_once:ok "
-        f"widgets={len(state.config.widgets)} gtfs={len(gtfs_widgets)} db={len(db_widgets)} "
-        f"departures={total_departures} duration_s={time.monotonic() - started_at:.2f}"
+def _polling_deps() -> PollingDeps:
+    return PollingDeps(
+        debug_log=debug_log,
+        app_log=app_log,
+        refresh_direction_mapping_if_due=refresh_direction_mapping_if_due,
+        reload_mapping_if_due=reload_mapping_if_due,
+        fetch_feed_bytes=fetch_feed_bytes,
+        all_widget_stop_ids=all_widget_stop_ids,
+        refresh_known_stop_ids_if_due=refresh_known_stop_ids_if_due,
+        collect_realtime_trip_context=collect_realtime_trip_context,
+        load_trip_maps_for_trip_ids_from_static_gtfs=load_trip_maps_for_trip_ids_from_static_gtfs,
+        persist_trip_maps_to_csv=persist_trip_maps_to_csv,
+        refresh_static_fallback_index_if_due=refresh_static_fallback_index_if_due,
+        extract_departures=extract_departures,
+        extract_static_schedule_departures=extract_static_schedule_departures,
+        merge_departures_realtime_with_fallback=merge_departures_realtime_with_fallback,
+        apply_direction_labels=apply_direction_labels,
+        register_observed_direction_entries=register_observed_direction_entries,
+        fetch_db_iris_departures=fetch_db_iris_departures,
     )
 
+
+async def poll_once(state: RuntimeState) -> None:
+    await service_poll_once(state, _polling_deps())
+
+
 async def ensure_data_fresh(state: RuntimeState, force: bool = False) -> None:
-    task: Optional[asyncio.Task] = None
-    should_wait = False
+    await service_ensure_data_fresh(state, _polling_deps(), force=force)
 
-    async with state.lock:
-        now_monotonic = time.monotonic()
-        has_cached_data = state.fetched_at_epoch is not None
-        is_stale = not has_cached_data or now_monotonic >= state.next_refresh_due_monotonic
 
-        if state.refresh_task and state.refresh_task.done():
-            state.refresh_task = None
-
-        if not force and not is_stale:
-            debug_log("ensure_data_fresh:cache_hit")
-            return
-
-        if state.refresh_task and not state.refresh_task.done():
-            task = state.refresh_task
-            should_wait = force or not has_cached_data
-            if should_wait:
-                debug_log("ensure_data_fresh:await_existing_refresh_task")
-            else:
-                debug_log("ensure_data_fresh:serve_stale_while_refreshing")
-        else:
-            task = asyncio.create_task(poll_once(state))
-            state.refresh_task = task
-            should_wait = force or not has_cached_data
-            if should_wait:
-                debug_log("ensure_data_fresh:start_new_refresh_task_wait")
-            else:
-                debug_log("ensure_data_fresh:start_new_refresh_task_background")
-
-    if task and should_wait:
-        try:
-            await task
-        finally:
-            async with state.lock:
-                if state.refresh_task is task and task.done():
-                    state.refresh_task = None
 def _build_24h_widget(widget: WidgetConfig) -> WidgetConfig:
     max_departures_24h = max(widget.max_departures, 4096)
     return replace(
@@ -2617,6 +2308,14 @@ async def run_static_cache_warmup(state: RuntimeState) -> None:
         debug_log("warmup_static_cache:skipped reason=no_gtfs_widgets")
         return
 
+    async with state.lock:
+        has_realtime_cache = state.fetched_at_epoch is not None
+
+    if not has_realtime_cache:
+        # Skip static warmup on cold start to avoid competing with first realtime fetch.
+        debug_log("warmup_static_cache:skipped_until_first_fetch")
+        return
+
     timeout_seconds = max(30, state.config.feed.http_timeout_seconds * 4)
     payload, load_error = await asyncio.to_thread(load_static_gtfs_archive_bytes, timeout_seconds)
     if payload is None:
@@ -2630,59 +2329,61 @@ async def run_static_cache_warmup(state: RuntimeState) -> None:
         "warmup_static_cache:done "
         f"bytes={len(payload)} widgets={len(gtfs_widgets)} duration_s={time.monotonic() - started_at:.2f}"
     )
+
     await refresh_known_stop_ids_if_due(state, force=True)
     await refresh_static_fallback_index_if_due(state, force=True)
 
+
 async def run_startup_warmup(state: RuntimeState) -> None:
-    started_at = time.monotonic()
-    debug_log("warmup_on_start:begin")
-    await ensure_data_fresh(state, force=True)
-    async with state.lock:
-        departures_count = sum(len(items) for items in state.departures_by_widget.values())
-        errors_count = sum(len(items) for items in state.errors_by_widget.values())
-        has_fetch = state.fetched_at_epoch is not None
-    debug_log(
-        "warmup_on_start:done "
-        f"has_fetch={has_fetch} departures={departures_count} errors={errors_count} "
-        f"duration_s={time.monotonic() - started_at:.2f}"
+    await service_run_startup_warmup(state, _polling_deps())
+
+
+def ensure_log_file_exists(path: str) -> Optional[str]:
+    global ACTIVE_LOG_PATH
+    resolved_path, path_warning = _prepare_writable_log_path(path)
+    if resolved_path is None:
+        return "Logdatei konnte nicht vorbereitet werden."
+    ACTIVE_LOG_PATH = str(resolved_path)
+    if path_warning:
+        app_log(path_warning)
+    return None
+
+
+def read_log_tail_lines(path: str, max_lines: int = LOG_TAIL_LINES) -> tuple[list[str], Optional[str]]:
+    prepare_error = ensure_log_file_exists(path)
+    if prepare_error:
+        return [], prepare_error
+
+    target = Path(ACTIVE_LOG_PATH)
+    try:
+        with target.open("r", encoding="utf-8", errors="replace") as handle:
+            tail = deque(handle, maxlen=max(1, int(max_lines)))
+        return [line.rstrip("\r\n") for line in tail], None
+    except Exception as exc:
+        return [], f"Logdatei konnte nicht gelesen werden: {exc}"
+
+
+def render_logs_html(
+    base_url: str,
+    log_path: str,
+    lines: list[str],
+    read_error: Optional[str],
+    startup_ready: bool,
+    startup_error: Optional[str],
+    startup_ready_since_epoch: Optional[int],
+) -> str:
+    return views_render_logs_html(
+        base_url,
+        log_path,
+        lines,
+        read_error,
+        startup_ready,
+        startup_error,
+        startup_ready_since_epoch,
+        app_version=APP_VERSION,
+        log_tail_lines=LOG_TAIL_LINES,
+        to_local_datetime_fn=to_local_datetime,
     )
-
-
-def _format_delay(delay_s: Optional[int]) -> str:
-    if delay_s is None:
-        return ""
-    delay_min = int(round(delay_s / 60))
-    sign = "+" if delay_min > 0 else ""
-    return f"{sign}{delay_min} min"
-
-
-def _format_direction_with_platform(direction: str, platform: Optional[str], direction_label: Optional[str] = None) -> str:
-    direction_text = (direction or "").strip() or "-"
-    custom_label = (direction_label or "").strip()
-    platform_text = (platform or "").strip()
-    if custom_label:
-        direction_text = f"{direction_text} ({custom_label})"
-    if not platform_text:
-        return direction_text
-    return f"{direction_text} (Gleis: {platform_text})"
-
-
-def _format_in_label(total_minutes: int) -> str:
-    minutes = max(0, int(total_minutes))
-    if minutes < 60:
-        return f"in {minutes} min"
-    hours = minutes // 60
-    rest_minutes = minutes % 60
-    if rest_minutes == 0:
-        return f"in {hours} h"
-    return f"in {hours} h {rest_minutes} min"
-
-
-def _format_fetched_line(fetched_at_epoch: Optional[int], age_s: Optional[int]) -> str:
-    if fetched_at_epoch is None or age_s is None:
-        return "Feed: keine erfolgreichen Daten"
-    fetched_local = to_local_datetime(fetched_at_epoch).strftime("%Y-%m-%d %H:%M:%S %Z")
-    return f"Feed: {fetched_local} | Alter: {age_s}s"
 
 
 def render_widget_html(
@@ -2692,411 +2393,40 @@ def render_widget_html(
     json_url: str,
     errors: Optional[list[str]] = None,
 ) -> str:
-    errors = errors or []
-    rows: list[str] = []
-    for dep in departures:
-        route = html.escape(dep.route or "-")
-        in_label = _format_in_label(dep.in_min)
-        time_epoch_attr = html.escape(str(dep.time_epoch))
-        direction = html.escape(_format_direction_with_platform(dep.direction, dep.platform, dep.direction_label))
-        delay_label = _format_delay(dep.delay_s) if widget.show_delay else ""
-        delay_class = "delay positive-delay" if widget.show_delay and dep.delay_s is not None and dep.delay_s > 0 else "delay"
-        rows.append(
-            (
-                "<tr>"
-                f"<td>{route}</td>"
-                f"<td>{direction}</td>"
-                f"<td>{html.escape(dep.time_local)}</td>"
-                f"<td class='in-min' data-time-epoch='{time_epoch_attr}'>{html.escape(in_label)}</td>"
-                f"<td class='{delay_class}'>{html.escape(delay_label)}</td>"
-                "</tr>"
-            )
-        )
-
-    if not rows and errors:
-        error_text = " | ".join(html.escape(error) for error in errors)
-        rows.append(f"<tr><td colspan='5'>{error_text}</td></tr>")
-    elif not rows:
-        rows.append("<tr><td colspan='5'>Keine Abfahrten verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar.</td></tr>")
-
-    rows_html = "".join(rows)
-    meta_block = ""
-    meta_line = ""
-    if widget.show_feed_age:
-        meta_line = _format_fetched_line(fetched_at_epoch, age_seconds(fetched_at_epoch))
-        meta_block = f"<div class='meta' id='feed-meta'>{html.escape(meta_line)}</div>"
-
-    initial_payload = json.dumps(
-        {
-            "fetched_at": fetched_at_epoch,
-            "departures": [dep.to_dict() for dep in departures],
-            "errors": errors,
-        },
-        ensure_ascii=False,
+    return views_render_widget_html(
+        widget,
+        departures,
+        fetched_at_epoch,
+        json_url,
+        errors,
+        app_version=APP_VERSION,
+        age_seconds_fn=age_seconds,
+        to_local_datetime_fn=to_local_datetime,
     )
-    show_delay_js = "true" if widget.show_delay else "false"
-    show_feed_age_js = "true" if widget.show_feed_age else "false"
-    json_url_js = json.dumps(json_url, ensure_ascii=False)
-    _ = meta_line  # keeps variable explicit for readability
-
-    title = html.escape(widget.title)
-    return f"""<!doctype html>
-<html lang="de">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <style>
-    :root {{
-      --bg: #f5f7fb;
-      --panel: #ffffff;
-      --text: #1f2937;
-      --muted: #6b7280;
-      --line: #d1d5db;
-      --accent: #0b4f8a;
-    }}
-    html, body {{
-      margin: 0;
-      padding: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-family: "Segoe UI", Tahoma, sans-serif;
-    }}
-    .wrap {{
-      box-sizing: border-box;
-      padding: 12px;
-      width: 100%;
-    }}
-    .card {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: hidden;
-    }}
-    .title {{
-      font-size: 18px;
-      font-weight: 700;
-      padding: 10px 12px;
-      background: var(--accent);
-      color: #ffffff;
-    }}
-    table {{
-      width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
-    }}
-    th, td {{
-      padding: 8px 10px;
-      border-bottom: 1px solid var(--line);
-      font-size: 14px;
-      text-align: left;
-    }}
-    th {{
-      color: var(--muted);
-      font-weight: 600;
-      background: #f9fafb;
-    }}
-    td.delay, th.delay {{
-      text-align: right;
-      white-space: nowrap;
-    }}
-    td.positive-delay {{
-      color: #b91c1c;
-      font-weight: 700;
-    }}
-    .meta {{
-      font-size: 12px;
-      color: var(--muted);
-      padding: 8px 10px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="card">
-      <div class="title">{title}</div>
-      <table>
-        <thead>
-          <tr>
-            <th>Linie</th>
-            <th>Fahrtrichtung</th>
-            <th>Zeit</th>
-            <th>In</th>
-            <th class="delay">Versp.</th>
-          </tr>
-        </thead>
-        <tbody id="departures-body">{rows_html}</tbody>
-      </table>
-      {meta_block}
-    </div>
-  </div>
-  <script>
-    const showDelay = {show_delay_js};
-    const showFeedAge = {show_feed_age_js};
-    const jsonUrl = {json_url_js};
-    let payload = {initial_payload};
-
-    function escapeHtml(value) {{
-      return String(value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#39;");
-    }}
-
-    function formatDelay(delaySeconds) {{
-      if (delaySeconds === null || delaySeconds === undefined) {{
-        return "";
-      }}
-      const delayMinutes = Math.round(Number(delaySeconds) / 60);
-      const sign = delayMinutes > 0 ? "+" : "";
-      return `${{sign}}${{delayMinutes}} min`;
-    }}
-
-    function formatDirection(directionValue, platformValue, customLabelValue) {{
-      let directionText = String(directionValue || "").trim() || "-";
-      const customLabelText = String(customLabelValue || "").trim();
-      const platformText = String(platformValue || "").trim();
-      if (customLabelText) {{
-        directionText = `${{directionText}} (${{customLabelText}})`;
-      }}
-      if (!platformText) {{
-        return directionText;
-      }}
-      return `${{directionText}} (Gleis: ${{platformText}})`;
-    }}
-
-    function formatInLabel(totalMinutes) {{
-      const minutes = Math.max(0, Number(totalMinutes || 0));
-      if (minutes < 60) {{
-        return `in ${{minutes}} min`;
-      }}
-      const hours = Math.floor(minutes / 60);
-      const restMinutes = minutes % 60;
-      if (restMinutes === 0) {{
-        return `in ${{hours}} h`;
-      }}
-      return `in ${{hours}} h ${{restMinutes}} min`;
-    }}
-
-    function formatFeedLine() {{
-      if (!showFeedAge) {{
-        return "";
-      }}
-      const fetchedAt = payload.fetched_at;
-      if (!fetchedAt) {{
-        return "Feed: keine erfolgreichen Daten";
-      }}
-      const fetchedDate = new Date(Number(fetchedAt) * 1000);
-      const dateText = fetchedDate.toLocaleString("sv-SE", {{
-        timeZone: "Europe/Berlin",
-        hour12: false
-      }});
-      const ageSeconds = Math.max(0, Math.floor(Date.now() / 1000 - Number(fetchedAt)));
-      return `Feed: ${{dateText}} | Alter: ${{ageSeconds}}s`;
-    }}
-
-    function renderRows() {{
-      const body = document.getElementById("departures-body");
-      if (!body) {{
-        return;
-      }}
-
-      const departures = Array.isArray(payload.departures) ? payload.departures : [];
-      const errors = Array.isArray(payload.errors) ? payload.errors : [];
-
-      if (departures.length > 0) {{
-        body.innerHTML = departures.map((dep) => {{
-          const route = dep.route ? escapeHtml(dep.route) : "-";
-          const direction = escapeHtml(formatDirection(dep.direction, dep.platform, dep.direction_label));
-          const timeLocal = escapeHtml(dep.time_local || "");
-          const timeEpoch = Number(dep.time_epoch || 0);
-          const inMin = timeEpoch > 0
-            ? Math.max(0, Math.floor((timeEpoch - Date.now() / 1000) / 60))
-            : Math.max(0, Number(dep.in_min || 0));
-          const inLabel = formatInLabel(inMin);
-          const delaySeconds = dep.delay_s === null || dep.delay_s === undefined ? null : Number(dep.delay_s);
-          const delay = showDelay ? escapeHtml(formatDelay(delaySeconds)) : "";
-          const delayClass = showDelay && delaySeconds !== null && delaySeconds > 0 ? "delay positive-delay" : "delay";
-          return `<tr><td>${{route}}</td><td>${{direction}}</td><td>${{timeLocal}}</td><td class="in-min" data-time-epoch="${{timeEpoch}}">${{escapeHtml(inLabel)}}</td><td class="${{delayClass}}">${{delay}}</td></tr>`;
-        }}).join("");
-        return;
-      }}
-
-      if (errors.length > 0) {{
-        body.innerHTML = `<tr><td colspan="5">${{escapeHtml(errors.join(" | "))}}</td></tr>`;
-        return;
-      }}
-
-      body.innerHTML = "<tr><td colspan='5'>Keine Abfahrten verfÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¼gbar.</td></tr>";
-    }}
-
-    function renderMeta() {{
-      if (!showFeedAge) {{
-        return;
-      }}
-      const meta = document.getElementById("feed-meta");
-      if (!meta) {{
-        return;
-      }}
-      meta.textContent = formatFeedLine();
-    }}
-
-    function updateRelativeTimes() {{
-      const cells = document.querySelectorAll("#departures-body td.in-min[data-time-epoch]");
-      cells.forEach((cell) => {{
-        const timeEpoch = Number(cell.getAttribute("data-time-epoch") || 0);
-        if (!timeEpoch) {{
-          return;
-        }}
-        const inMin = Math.max(0, Math.floor((timeEpoch - Date.now() / 1000) / 60));
-        cell.textContent = formatInLabel(inMin);
-      }});
-    }}
-
-    async function refreshData() {{
-      try {{
-        const response = await fetch(jsonUrl, {{ cache: "no-store" }});
-        if (!response.ok) {{
-          return;
-        }}
-        const next = await response.json();
-        payload = {{
-          fetched_at: next.fetched_at,
-          departures: next.departures || [],
-          errors: next.errors || []
-        }};
-        renderRows();
-        renderMeta();
-      }} catch (_error) {{
-        // Keep current payload when refresh fails.
-      }}
-    }}
-
-    renderRows();
-    renderMeta();
-    updateRelativeTimes();
-    setInterval(refreshData, 30000);
-    setInterval(updateRelativeTimes, 1000);
-    setInterval(renderMeta, 1000);
-  </script>
-</body>
-</html>
-"""
 
 
 def render_widget_index_html(config: AppConfig, base_url: str) -> str:
-    rows: list[str] = []
-    root = base_url.rstrip("/")
-    for widget in config.widgets:
-        widget_url = f"{root}/widget/{widget.id}"
-        widget_24h_url = f"{root}/widget/{widget.id}/24h"
-        json_url = f"{root}/json/{widget.id}"
-        json_24h_url = f"{root}/json/{widget.id}/24h"
-        stop_ids = ", ".join(widget.stop_ids) if widget.stop_ids else "-"
-        source_label = widget.source
-        if widget.source == "db_iris" and widget.db_eva_no:
-            source_label = f"{widget.source} (eva={widget.db_eva_no})"
-        rows.append(
-            "<tr>"
-            f"<td>{html.escape(widget.id)}</td>"
-            f"<td>{html.escape(widget.title)}</td>"
-            f"<td>{html.escape(source_label)}</td>"
-            f"<td><a href='{html.escape(widget_url)}'>{html.escape(widget_url)}</a><br/><a href='{html.escape(widget_24h_url)}'>{html.escape(widget_24h_url)}</a></td>"
-            f"<td><a href='{html.escape(json_url)}'>{html.escape(json_url)}</a><br/><a href='{html.escape(json_24h_url)}'>{html.escape(json_24h_url)}</a></td>"
-            f"<td>{html.escape(stop_ids)}</td>"
-            "</tr>"
-        )
-    table_rows = "".join(rows) if rows else "<tr><td colspan='6'>Keine Widgets konfiguriert.</td></tr>"
-    return f"""<!doctype html>
-<html lang="de">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Widget-\u00dcbersicht</title>
-  <style>
-    body {{ font-family: "Segoe UI", Tahoma, sans-serif; margin: 16px; background: #f5f7fb; color: #1f2937; }}
-    table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d1d5db; border-radius: 8px; overflow: hidden; }}
-    th, td {{ padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: left; font-size: 14px; }}
-    th {{ background: #0b4f8a; color: #fff; }}
-    a {{ color: #0b4f8a; text-decoration: none; }}
-  </style>
-</head>
-<body>
-  <h2>Verf\u00fcgbare Widgets</h2>
-  <p>Direkter Aufruf je Widget-ID: <code>/widget/&lt;id&gt;</code> | 24h-Ansicht: <code>/widget/&lt;id&gt;/24h</code></p>
-  <table>
-    <thead>
-      <tr><th>ID</th><th>Titel</th><th>Quelle</th><th>Widget-URL</th><th>JSON-URL</th><th>Stop-IDs</th></tr>
-    </thead>
-    <tbody>{table_rows}</tbody>
-  </table>
-</body>
-</html>
-"""
+    return views_render_widget_index_html(config, base_url, app_version=APP_VERSION)
 
 
-def render_service_index_html(config: AppConfig, base_url: str) -> str:
-    root = base_url.rstrip("/")
-    endpoint_rows = [
-        ("Widget-Übersicht", f"{root}/widget", "Alle konfigurierten Widgets mit Direkt-URLs"),
-        ("Widget (Standard)", f"{root}/widget/<id>", "Nächste Abfahrten je Widget-ID"),
-        ("Widget (24h)", f"{root}/widget/<id>/24h", "Alle Abfahrten der nächsten 24 Stunden"),
-        ("JSON (Standard)", f"{root}/json/<id>", "JSON-Daten für Standardansicht"),
-        ("JSON (24h)", f"{root}/json/<id>/24h", "JSON-Daten für 24h-Ansicht"),
-        ("Health", f"{root}/health", "Technischer Status und Feed-Alter"),
-        ("Debug-Status", f"{root}/debug", "Aktueller Debug-Modus"),
-        ("OpenAPI", f"{root}/docs", "Interaktive API-Dokumentation"),
-    ]
-    widget_links = "".join(
-        f"<li><a href='{html.escape(f'{root}/widget/{widget.id}')}'>{html.escape(widget.title)}"
-        f" (ID {html.escape(widget.id)})</a></li>"
-        for widget in config.widgets
-    )
-    if not widget_links:
-        widget_links = "<li>Keine Widgets konfiguriert.</li>"
-
-    endpoint_html = "".join(
-        "<tr>"
-        f"<td>{html.escape(name)}</td>"
-        f"<td><code>{html.escape(url)}</code></td>"
-        f"<td>{html.escape(description)}</td>"
-        "</tr>"
-        for name, url, description in endpoint_rows
+def render_service_index_html(
+    config: AppConfig,
+    base_url: str,
+    startup_ready: bool,
+    startup_error: Optional[str],
+    startup_ready_since_epoch: Optional[int],
+) -> str:
+    return views_render_service_index_html(
+        config,
+        base_url,
+        startup_ready,
+        startup_error,
+        startup_ready_since_epoch,
+        app_version=APP_VERSION,
+        log_tail_lines=LOG_TAIL_LINES,
+        to_local_datetime_fn=to_local_datetime,
     )
 
-    return f"""<!doctype html>
-<html lang="de">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>timetable-widget API</title>
-  <style>
-    body {{ font-family: "Segoe UI", Tahoma, sans-serif; margin: 16px; background: #f5f7fb; color: #1f2937; }}
-    h2 {{ margin: 0 0 10px; }}
-    .hint {{ margin-bottom: 12px; color: #374151; }}
-    table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d1d5db; border-radius: 8px; overflow: hidden; }}
-    th, td {{ padding: 10px; border-bottom: 1px solid #e5e7eb; text-align: left; font-size: 14px; vertical-align: top; }}
-    th {{ background: #0b4f8a; color: #fff; }}
-    code {{ background: #eef2ff; padding: 1px 4px; border-radius: 4px; }}
-    a {{ color: #0b4f8a; text-decoration: none; }}
-  </style>
-</head>
-<body>
-  <h2>timetable-widget</h2>
-  <p class="hint">Technische Startseite. Für die Widget-Ansicht direkt <a href="{html.escape(f'{root}/widget')}"><code>/widget</code></a> aufrufen.</p>
-  <table>
-    <thead>
-      <tr><th>Endpunkt</th><th>URL</th><th>Beschreibung</th></tr>
-    </thead>
-    <tbody>{endpoint_html}</tbody>
-  </table>
-  <h3>Konfigurierte Widgets</h3>
-  <ul>{widget_links}</ul>
-</body>
-</html>
-"""
 
 def build_config_excerpt(config: AppConfig) -> dict:
     return {
@@ -3145,18 +2475,111 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        if WARMUP_STATIC_CACHE_ON_START:
-            await run_static_cache_warmup(state)
-        if WARMUP_ON_START:
-            await run_startup_warmup(state)
-        yield
+        async def _run_startup_tasks() -> None:
+            app_log("startup_background:begin")
+            try:
+                if WARMUP_STATIC_CACHE_ON_START:
+                    await run_static_cache_warmup(state)
+                if WARMUP_ON_START:
+                    await run_startup_warmup(state)
+            except Exception as exc:
+                app_log(f"startup_background:error error={exc}")
+                async with state.lock:
+                    state.startup_error = str(exc)
+            finally:
+                async with state.lock:
+                    state.startup_ready = True
+                    state.startup_ready_since_epoch = int(time.time())
+                    state.startup_task = None
+                app_log("startup_background:done")
 
-    app = FastAPI(title="timetable-widget", lifespan=lifespan)
+        async with state.lock:
+            state.startup_ready = False
+            state.startup_error = None
+            state.startup_ready_since_epoch = None
+
+        startup_task = asyncio.create_task(_run_startup_tasks())
+        async with state.lock:
+            state.startup_task = startup_task
+
+        try:
+            yield
+        finally:
+            async with state.lock:
+                task = state.startup_task
+            if task is not None and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    app = FastAPI(title="timetable-widget", version=APP_VERSION, lifespan=lifespan)
     app.state.runtime = state
 
+    @app.middleware("http")
+    async def log_requests(request: Request, call_next):
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            if not request.url.path.startswith("/logs"):
+                app_log(
+                    f"request:error method={request.method} path={request.url.path} duration_ms={duration_ms} error={exc}"
+                )
+            raise
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        if not request.url.path.startswith("/logs"):
+            app_log(
+                f"request method={request.method} path={request.url.path} status={response.status_code} duration_ms={duration_ms}"
+            )
+        return response
     @app.get("/", response_class=HTMLResponse)
     async def get_service_index(request: Request) -> HTMLResponse:
-        return HTMLResponse(render_service_index_html(config, str(request.base_url)))
+        async with state.lock:
+            startup_ready = state.startup_ready
+            startup_error = state.startup_error
+            startup_ready_since_epoch = state.startup_ready_since_epoch
+        return HTMLResponse(render_service_index_html(config, str(request.base_url), startup_ready, startup_error, startup_ready_since_epoch))
+    @app.get("/logs", response_class=HTMLResponse)
+    async def get_logs(request: Request, format: str = "html"):
+        lines, read_error = await asyncio.to_thread(read_log_tail_lines, ACTIVE_LOG_PATH, LOG_TAIL_LINES)
+        async with state.lock:
+            startup_ready = state.startup_ready
+            startup_error = state.startup_error
+            startup_ready_since_epoch = state.startup_ready_since_epoch
+
+        payload_lines = list(lines)
+        if read_error:
+            payload_lines = [read_error, "", *payload_lines]
+        text_payload = "\n".join(payload_lines)
+
+        output_format = (format or "html").strip().lower()
+        if output_format == "text":
+            return PlainTextResponse(text_payload)
+        if output_format == "json":
+            return JSONResponse(
+                {
+                    "app_version": APP_VERSION,
+                    "log_path": ACTIVE_LOG_PATH,
+                    "tail_lines": lines,
+                    "read_error": read_error,
+                    "startup_ready": startup_ready,
+                    "startup_error": startup_error,
+                    "startup_ready_since_epoch": startup_ready_since_epoch,
+                }
+            )
+        return HTMLResponse(
+            render_logs_html(
+                str(request.base_url),
+                ACTIVE_LOG_PATH,
+                lines,
+                read_error,
+                startup_ready,
+                startup_error,
+                startup_ready_since_epoch,
+            )
+        )
+
     @app.get("/widget", response_class=HTMLResponse)
     async def get_widget_overview(request: Request) -> HTMLResponse:
         return HTMLResponse(render_widget_index_html(config, str(request.base_url)))
@@ -3170,6 +2593,7 @@ def create_app(config: AppConfig) -> FastAPI:
             "age_s": age_seconds(fetched_at_epoch),
             "departures": [dep.to_dict() for dep in departures],
             "errors": errors,
+            "app_version": APP_VERSION,
             "widgets": [{"id": w.id, "title": w.title} for w in config.widgets],
             "config": build_config_excerpt(config),
         }
@@ -3212,6 +2636,7 @@ def create_app(config: AppConfig) -> FastAPI:
         return JSONResponse(
             {
                 "ok": True,
+                "app_version": APP_VERSION,
                 "age_s": age_seconds(fetched_at_epoch),
                 "errors": aggregated_errors,
             }
@@ -3256,4 +2681,83 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
