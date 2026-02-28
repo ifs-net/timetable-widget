@@ -38,7 +38,9 @@ def _format_direction_with_platform(direction: str, platform: Optional[str], dir
     return f"{direction_text} (Gleis: {platform_text})"
 
 
-def _format_in_label(total_minutes: int) -> str:
+def _format_in_label(total_minutes: int, cancelled: bool = False) -> str:
+    if cancelled:
+        return "entf\u00e4llt"
     minutes = max(0, int(total_minutes))
     if minutes < 60:
         return f"in {minutes} min"
@@ -93,7 +95,7 @@ def render_logs_html(
     if lines:
         content_lines.extend(lines)
     elif not read_error:
-        content_lines.append("(Keine Log-Eintraege vorhanden)")
+        content_lines.append("(Keine Log-Einträge vorhanden)")
     content_text = "\n".join(content_lines)
 
     return f"""<!doctype html>
@@ -117,7 +119,7 @@ def render_logs_html(
 </head>
 <body>
   <h2>Log-Ansicht</h2>
-  <div class="meta">Datei: <code>{html.escape(log_path)}</code> | Letzte {log_tail_lines} Eintraege | Version: {html.escape(app_version)}</div>
+  <div class="meta">Datei: <code>{html.escape(log_path)}</code> | Letzte {log_tail_lines} Einträge | Version: {html.escape(app_version)}</div>
   <div class="status {status_class}">{html.escape(status_text)} - <a href="{html.escape(f'{root}/')}">Zur Startseite</a></div>
   <div class="log-controls">
     <label><input type="checkbox" id="auto-scroll" checked /> Auto Scroll</label>
@@ -191,10 +193,12 @@ def render_widget_html(
     rows: list[str] = []
     for dep in departures:
         route = html.escape(dep.route or "-")
-        in_label = _format_in_label(dep.in_min)
-        time_epoch_attr = html.escape(str(dep.time_epoch))
+        in_label = _format_in_label(dep.in_min, getattr(dep, "cancelled", False))
+        time_epoch_attr = html.escape(str(dep.time_epoch)) if not getattr(dep, "cancelled", False) else ""
         direction = html.escape(_format_direction_with_platform(dep.direction, dep.platform, dep.direction_label))
-        delay_label = _format_delay(dep.delay_s) if widget.show_delay else ""
+        delay_label = _format_delay(dep.delay_s) if widget.show_delay and not getattr(dep, "cancelled", False) else ""
+        row_class = " class='cancelled-row'" if getattr(dep, "cancelled", False) else ""
+        time_epoch_html_attr = f" data-time-epoch='{time_epoch_attr}'" if time_epoch_attr else ""
         delay_class = "delay"
         if widget.show_delay:
             delay_min = _delay_minutes_for_display(dep.delay_s)
@@ -204,11 +208,11 @@ def render_widget_html(
                 delay_class = "delay negative-delay"
         rows.append(
             (
-                "<tr>"
+                f"<tr{row_class}>"
                 f"<td>{route}</td>"
                 f"<td>{direction}</td>"
                 f"<td>{html.escape(dep.time_local)}</td>"
-                f"<td class='in-min' data-time-epoch='{time_epoch_attr}'>{html.escape(in_label)}</td>"
+                f"<td class='in-min'{time_epoch_html_attr}>{html.escape(in_label)}</td>"
                 f"<td class='{delay_class}'>{html.escape(delay_label)}</td>"
                 "</tr>"
             )
@@ -218,7 +222,7 @@ def render_widget_html(
         error_text = " | ".join(html.escape(error) for error in errors)
         rows.append(f"<tr><td colspan='5'>{error_text}</td></tr>")
     elif not rows:
-        rows.append("<tr><td colspan='5'>Keine Abfahrten verfuegbar.</td></tr>")
+        rows.append("<tr><td colspan='5'>Keine Abfahrten verf\u00fcgbar.</td></tr>")
 
     rows_html = "".join(rows)
     meta_line = _format_fetched_line(fetched_at_epoch, age_seconds_fn(fetched_at_epoch), widget.show_feed_age, app_version, to_local_datetime_fn)
@@ -305,6 +309,16 @@ def render_widget_html(
     td.negative-delay {{
       color: #15803d;
       font-weight: 700;
+    }}
+    tr.cancelled-row td {{
+      color: #6b7280;
+      text-decoration: line-through;
+    }}
+    tr.cancelled-row td.in-min,
+    tr.cancelled-row td.delay {{
+      text-decoration: none;
+      font-weight: 700;
+      color: #b45309;
     }}
     .meta {{
       font-size: 12px;
@@ -400,6 +414,10 @@ def render_widget_html(
       return `in ${{hours}} h ${{restMinutes}} min`;
     }}
 
+    function isCancelled(dep) {{
+      return !!dep.cancelled || dep.scheduled_relationship === "SKIPPED";
+    }}
+
     function formatFeedLine() {{
       const versionText = `Version: ${{appVersion}}`;
       if (!showFeedAge) {{
@@ -433,13 +451,14 @@ def render_widget_html(
           const direction = escapeHtml(formatDirection(dep.direction, dep.platform, dep.direction_label));
           const timeLocal = escapeHtml(dep.time_local || "");
           const timeEpoch = Number(dep.time_epoch || 0);
+          const cancelled = isCancelled(dep);
           const inMin = timeEpoch > 0
             ? Math.max(0, Math.floor((timeEpoch - Date.now() / 1000) / 60))
             : Math.max(0, Number(dep.in_min || 0));
-          const inLabel = formatInLabel(inMin);
+          const inLabel = cancelled ? "entf\u00e4llt" : formatInLabel(inMin);
           const delaySeconds = dep.delay_s === null || dep.delay_s === undefined ? null : Number(dep.delay_s);
           const delayMinutes = delayMinutesForDisplay(delaySeconds);
-          const delay = showDelay ? escapeHtml(formatDelay(delaySeconds)) : "";
+          const delay = showDelay && !cancelled ? escapeHtml(formatDelay(delaySeconds)) : "";
           let delayClass = "delay";
           if (showDelay && delayMinutes !== null) {{
             if (delayMinutes > 0) {{
@@ -448,7 +467,9 @@ def render_widget_html(
               delayClass = "delay negative-delay";
             }}
           }}
-          return `<tr><td>${{route}}</td><td>${{direction}}</td><td>${{timeLocal}}</td><td class="in-min" data-time-epoch="${{timeEpoch}}">${{escapeHtml(inLabel)}}</td><td class="${{delayClass}}">${{delay}}</td></tr>`;
+          const rowClass = cancelled ? ' class="cancelled-row"' : '';
+          const timeEpochAttr = cancelled ? '' : ` data-time-epoch="${{timeEpoch}}"`;
+          return `<tr${{rowClass}}><td>${{route}}</td><td>${{direction}}</td><td>${{timeLocal}}</td><td class="in-min"${{timeEpochAttr}}>${{escapeHtml(inLabel)}}</td><td class="${{delayClass}}">${{delay}}</td></tr>`;
         }}).join("");
         return;
       }}
@@ -458,7 +479,7 @@ def render_widget_html(
         return;
       }}
 
-      body.innerHTML = "<tr><td colspan='5'>Keine Abfahrten verfuegbar.</td></tr>";
+      body.innerHTML = "<tr><td colspan='5'>Keine Abfahrten verf\u00fcgbar.</td></tr>";
     }}
 
     function renderMeta() {{
@@ -543,7 +564,7 @@ def render_widget_index_html(config: Any, base_url: str, *, app_version: str) ->
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Widget-Uebersicht - v{html.escape(app_version)}</title>
+  <title>Widget-übersicht - v{html.escape(app_version)}</title>
   <style>
     body {{ font-family: "Segoe UI", Tahoma, sans-serif; margin: 16px; background: #f5f7fb; color: #1f2937; }}
     table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #d1d5db; border-radius: 8px; overflow: hidden; }}
@@ -553,7 +574,7 @@ def render_widget_index_html(config: Any, base_url: str, *, app_version: str) ->
   </style>
 </head>
 <body>
-  <h2>Verfuegbare Widgets</h2>
+  <h2>Verfügbare Widgets</h2>
   <p>Direkter Aufruf je Widget-ID: <code>/widget/&lt;id&gt;</code> | 24h-Ansicht: <code>/widget/&lt;id&gt;/24h</code></p>
   <p><strong>Version:</strong> {html.escape(app_version)}</p>
   <table>
@@ -588,15 +609,15 @@ def render_service_index_html(
         status_text = f"{status_text} | Startup-Hinweis: {startup_error}"
 
     endpoint_rows = [
-        ("Widget-Uebersicht", f"{root}/widget", "Alle konfigurierten Widgets mit Direkt-URLs"),
-        ("Widget (Standard)", f"{root}/widget/<id>", "Naechste Abfahrten je Widget-ID"),
-        ("Widget (24h)", f"{root}/widget/<id>/24h", "Alle Abfahrten der naechsten 24 Stunden"),
-        ("JSON (Standard)", f"{root}/json/<id>", "JSON-Daten fuer Standardansicht"),
-        ("JSON (24h)", f"{root}/json/<id>/24h", "JSON-Daten fuer 24h-Ansicht"),
+        ("Widget-übersicht", f"{root}/widget", "Alle konfigurierten Widgets mit Direkt-URLs"),
+        ("Widget (Standard)", f"{root}/widget/<id>", "Nächste Abfahrten je Widget-ID"),
+        ("Widget (24h)", f"{root}/widget/<id>/24h", "Alle Abfahrten der nächsten 24 Stunden"),
+        ("JSON (Standard)", f"{root}/json/<id>", "JSON-Daten für Standardansicht"),
+        ("JSON (24h)", f"{root}/json/<id>/24h", "JSON-Daten für 24h-Ansicht"),
         ("Health", f"{root}/health", "Technischer Status und Feed-Alter"),
         ("Debug-Status", f"{root}/debug", "Aktueller Debug-Modus"),
         ("Debug-Umschalter", f"{root}/switchdebugmode", "Debug-Modus per GUI umschalten"),
-        ("Logs", f"{root}/logs", f"Letzte {log_tail_lines} Log-Eintraege (Live-Ansicht)"),
+        ("Logs", f"{root}/logs", f"Letzte {log_tail_lines} Log-Einträge (Live-Ansicht)"),
         ("OpenAPI", f"{root}/docs", "Interaktive API-Dokumentation"),
     ]
 
@@ -640,7 +661,7 @@ def render_service_index_html(
 </head>
 <body>
   <h2>timetable-widget</h2>
-  <p class="hint">Technische Startseite. Fuer die Widget-Ansicht direkt <a href="{html.escape(f'{root}/widget')}"><code>/widget</code></a> aufrufen.</p>
+  <p class="hint">Technische Startseite. Für die Widget-Ansicht direkt <a href="{html.escape(f'{root}/widget')}"><code>/widget</code></a> aufrufen.</p>
   <p><strong>Version:</strong> {html.escape(app_version)}</p>
   <div id="service-status" class="status {status_class}">{html.escape(status_text)} - <a href="{html.escape(f'{root}/logs')}">Log anzeigen</a></div>
   <table>

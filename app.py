@@ -13,10 +13,12 @@ import re
 import socket
 import threading
 import time
+import unicodedata
 import zipfile
-from collections import deque
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field, replace
+from math import asin, cos, radians, sin, sqrt
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -561,10 +563,19 @@ class DebugConfig:
 
 
 @dataclass
+class StationSelectorConfig:
+    name: str
+    latitude: Optional[float]
+    longitude: Optional[float]
+    radius_m: int
+
+
+@dataclass
 class WidgetConfig:
     id: str
     title: str
     stop_ids: list[str]
+    station_selector: Optional[StationSelectorConfig]
     route_short_names: Optional[list[str]]
     source: str
     db_eva_no: Optional[str]
@@ -606,6 +617,8 @@ class Departure:
     delay_s: Optional[int]
     trip_id: str
     direction_label: Optional[str] = None
+    cancelled: bool = False
+    scheduled_relationship: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -619,7 +632,15 @@ class Departure:
             "in_min": self.in_min,
             "delay_s": self.delay_s,
             "trip_id": self.trip_id,
+            "cancelled": self.cancelled,
+            "scheduled_relationship": self.scheduled_relationship,
         }
+
+
+@dataclass
+class GTFSRealtimeExtractionResult:
+    departures: list[Departure]
+    non_scheduled_trip_stops: dict[tuple[str, str], str] = field(default_factory=dict)
 
 
 @dataclass
@@ -636,6 +657,22 @@ class StaticFallbackIndex:
 
 
 @dataclass
+class StopCatalogEntry:
+    stop_id: str
+    stop_name: str
+    parent_station: str
+    stop_lat: Optional[float]
+    stop_lon: Optional[float]
+
+
+@dataclass
+class StopCatalog:
+    by_id: dict[str, StopCatalogEntry]
+    children_by_parent: dict[str, list[str]]
+    name_index: dict[str, list[str]]
+
+
+@dataclass
 class RuntimeState:
     config: AppConfig
     departures_by_widget: dict[str, list[Departure]] = field(default_factory=dict)
@@ -649,6 +686,10 @@ class RuntimeState:
     known_stop_ids: set[str] = field(default_factory=set)
     known_stop_ids_error: Optional[str] = None
     next_known_stop_ids_reload_monotonic: float = 0.0
+    stop_catalog: Optional[StopCatalog] = None
+    resolved_stop_ids_by_widget: dict[str, list[str]] = field(default_factory=dict)
+    stop_validation_errors_by_widget: dict[str, list[str]] = field(default_factory=dict)
+    gtfs_non_scheduled_trip_stops_by_widget: dict[str, dict[tuple[str, str], str]] = field(default_factory=dict)
     static_fallback_index: Optional[StaticFallbackIndex] = None
     static_fallback_error: Optional[str] = None
     next_static_fallback_reload_monotonic: float = 0.0
@@ -726,6 +767,15 @@ def _to_int(value, default: int, key: str, min_value: int = 0, max_value: Option
 def _to_str(value, default: str) -> str:
     candidate = default if value is None else value
     return str(candidate).strip()
+
+
+def _to_optional_float(value, key: str) -> Optional[float]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a float") from exc
 
 
 def _to_non_empty_str(value, default: str, key: str) -> str:
@@ -817,11 +867,28 @@ def parse_config(data: dict) -> AppConfig:
             required_stops = _to_str_list(
                 widget_data.get("required_stops"), f"widgets[{idx}].required_stops"
             )
+        station_selector: Optional[StationSelectorConfig] = None
+        station_selector_data = widget_data.get("station_selector")
+        if station_selector_data is not None:
+            if not isinstance(station_selector_data, dict):
+                raise ValueError(f"widgets[{idx}].station_selector must be a mapping")
+            station_selector = StationSelectorConfig(
+                name=_to_non_empty_str(
+                    station_selector_data.get("name"),
+                    _to_non_empty_str(widget_data.get("title"), f"Widget {idx + 1}", f"widgets[{idx}].title"),
+                    f"widgets[{idx}].station_selector.name",
+                ),
+                latitude=_to_optional_float(station_selector_data.get("latitude"), f"widgets[{idx}].station_selector.latitude"),
+                longitude=_to_optional_float(station_selector_data.get("longitude"), f"widgets[{idx}].station_selector.longitude"),
+                radius_m=_to_int(station_selector_data.get("radius_m"), 750, f"widgets[{idx}].station_selector.radius_m", min_value=25, max_value=50000),
+            )
+
         widgets.append(
             WidgetConfig(
                 id=_to_non_empty_str(widget_data.get("id"), str(idx + 1), f"widgets[{idx}].id"),
                 title=_to_non_empty_str(widget_data.get("title"), f"Widget {idx + 1}", f"widgets[{idx}].title"),
                 stop_ids=_to_str_list(widget_data.get("stop_ids", []), f"widgets[{idx}].stop_ids"),
+                station_selector=station_selector,
                 route_short_names=route_short_names,
                 source=_normalize_widget_source(widget_data.get("source", "gtfs_rt"), f"widgets[{idx}].source"),
                 db_eva_no=_to_str(widget_data.get("db_eva_no"), "") or None,
@@ -866,13 +933,214 @@ def parse_config(data: dict) -> AppConfig:
     return AppConfig(server=server, feed=feed, debug=debug, widgets=widgets, mapping=mapping)
 
 
-def all_widget_stop_ids(config: AppConfig, source: Optional[str] = None) -> list[str]:
+def all_widget_stop_ids(config_or_state, source: Optional[str] = None) -> list[str]:
+    state = config_or_state if hasattr(config_or_state, "config") else None
+    config = state.config if state is not None else config_or_state
+    resolved = getattr(state, "resolved_stop_ids_by_widget", {}) if state is not None else {}
+
     merged: set[str] = set()
     for widget in config.widgets:
         if source and widget.source != source:
             continue
-        merged.update(widget.stop_ids)
+        effective_stop_ids = list(resolved.get(widget.id) or widget.stop_ids)
+        merged.update(stop_id for stop_id in effective_stop_ids if stop_id)
     return sorted(merged)
+
+
+def _normalize_stop_lookup_name(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "")).casefold()
+    text = text.replace("ß", "ss")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _haversine_m(latitude_a: float, longitude_a: float, latitude_b: float, longitude_b: float) -> float:
+    radius_m = 6371000.0
+    lat1 = radians(latitude_a)
+    lon1 = radians(longitude_a)
+    lat2 = radians(latitude_b)
+    lon2 = radians(longitude_b)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    sin_dlat = sin(dlat / 2.0)
+    sin_dlon = sin(dlon / 2.0)
+    h = sin_dlat * sin_dlat + cos(lat1) * cos(lat2) * sin_dlon * sin_dlon
+    return 2.0 * radius_m * asin(min(1.0, sqrt(max(0.0, h))))
+
+
+def _mean_coordinates(entries: list[StopCatalogEntry]) -> tuple[Optional[float], Optional[float]]:
+    coords = [(entry.stop_lat, entry.stop_lon) for entry in entries if entry.stop_lat is not None and entry.stop_lon is not None]
+    if not coords:
+        return None, None
+    return (
+        sum(lat for lat, _lon in coords) / len(coords),
+        sum(lon for _lat, lon in coords) / len(coords),
+    )
+
+
+def _widget_selector(widget: WidgetConfig) -> Optional[StationSelectorConfig]:
+    if widget.source != "gtfs_rt":
+        return None
+    if widget.station_selector is not None:
+        return widget.station_selector
+    title = str(widget.title or "").strip()
+    if not title:
+        return None
+    return StationSelectorConfig(name=title, latitude=None, longitude=None, radius_m=750)
+
+
+def _build_stop_catalog(payload: bytes) -> StopCatalog:
+    by_id: dict[str, StopCatalogEntry] = {}
+    children_by_parent: dict[str, list[str]] = defaultdict(list)
+    name_index: dict[str, list[str]] = defaultdict(list)
+
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+        with archive.open("stops.txt", "r") as handle:
+            reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
+            for row in reader:
+                stop_id = str(row.get("stop_id", "")).strip()
+                if not stop_id:
+                    continue
+                stop_name = str(row.get("stop_name", "")).strip()
+                parent_station = str(row.get("parent_station", "")).strip()
+                stop_lat = _to_optional_float(row.get("stop_lat"), "stops.txt.stop_lat")
+                stop_lon = _to_optional_float(row.get("stop_lon"), "stops.txt.stop_lon")
+                entry = StopCatalogEntry(
+                    stop_id=stop_id,
+                    stop_name=stop_name,
+                    parent_station=parent_station,
+                    stop_lat=stop_lat,
+                    stop_lon=stop_lon,
+                )
+                by_id[stop_id] = entry
+                key = _normalize_stop_lookup_name(stop_name)
+                if key:
+                    name_index[key].append(stop_id)
+                if parent_station:
+                    children_by_parent[parent_station].append(stop_id)
+
+    return StopCatalog(
+        by_id=by_id,
+        children_by_parent={key: sorted(set(value)) for key, value in children_by_parent.items()},
+        name_index={key: sorted(set(value)) for key, value in name_index.items()},
+    )
+
+
+def _resolve_widget_stop_ids_from_catalog(
+    widget: WidgetConfig,
+    catalog: StopCatalog,
+    reference_point: Optional[tuple[float, float]] = None,
+) -> tuple[list[str], list[str], Optional[tuple[float, float]]]:
+    selector = _widget_selector(widget)
+    if selector is None:
+        return list(widget.stop_ids), [], None
+
+    selector_name_key = _normalize_stop_lookup_name(selector.name)
+    if not selector_name_key:
+        return list(widget.stop_ids), [f"Widget {widget.id}: station_selector.name ist leer."], None
+
+    candidate_stop_ids = list(catalog.name_index.get(selector_name_key, []))
+    if not candidate_stop_ids:
+        return list(widget.stop_ids), [f"Widget {widget.id}: Haltestelle '{selector.name}' im GTFS nicht gefunden."], None
+
+    cluster_candidates: dict[str, list[StopCatalogEntry]] = {}
+    for stop_id in candidate_stop_ids:
+        entry = catalog.by_id.get(stop_id)
+        if entry is None:
+            continue
+        cluster_key = entry.parent_station or entry.stop_id
+        child_ids = catalog.children_by_parent.get(cluster_key) or [cluster_key]
+        entries = [catalog.by_id[child_id] for child_id in child_ids if child_id in catalog.by_id]
+        if not entries and cluster_key in catalog.by_id:
+            entries = [catalog.by_id[cluster_key]]
+        if entries:
+            cluster_candidates[cluster_key] = entries
+
+    if not cluster_candidates:
+        return list(widget.stop_ids), [f"Widget {widget.id}: Keine verwendbaren Steige für '{selector.name}' gefunden."], None
+
+    scored: list[tuple[float, str, list[StopCatalogEntry], tuple[Optional[float], Optional[float]]]] = []
+    for cluster_key, entries in cluster_candidates.items():
+        cluster_lat, cluster_lon = _mean_coordinates(entries)
+        distance_score = None
+        if selector.latitude is not None and selector.longitude is not None and cluster_lat is not None and cluster_lon is not None:
+            distance_score = _haversine_m(selector.latitude, selector.longitude, cluster_lat, cluster_lon)
+        elif reference_point is not None and cluster_lat is not None and cluster_lon is not None:
+            distance_score = _haversine_m(reference_point[0], reference_point[1], cluster_lat, cluster_lon)
+        else:
+            distance_score = 0.0
+        scored.append((float(distance_score), cluster_key, entries, (cluster_lat, cluster_lon)))
+
+    scored.sort(key=lambda item: item[0])
+    best_score, best_cluster_key, best_entries, best_coords = scored[0]
+
+    errors: list[str] = []
+    if selector.latitude is not None and selector.longitude is not None:
+        if best_coords[0] is None or best_coords[1] is None:
+            errors.append(f"Widget {widget.id}: Haltestelle '{selector.name}' ohne Koordinaten im GTFS gefunden.")
+        elif best_score > selector.radius_m:
+            errors.append(
+                f"Widget {widget.id}: Haltestelle '{selector.name}' nur ausserhalb von {selector.radius_m} m gefunden."
+            )
+            return list(widget.stop_ids), errors, best_coords if best_coords[0] is not None and best_coords[1] is not None else None
+    elif len(scored) > 1 and reference_point is None:
+        errors.append(
+            f"Widget {widget.id}: Haltestelle '{selector.name}' ist mehrdeutig. Bitte station_selector mit Koordinaten hinterlegen."
+        )
+        return list(widget.stop_ids), errors, best_coords if best_coords[0] is not None and best_coords[1] is not None else None
+
+    resolved_stop_ids = sorted({entry.stop_id for entry in best_entries if entry.stop_id})
+    if widget.stop_ids and sorted(widget.stop_ids) != resolved_stop_ids:
+        app_log(
+            f"stop_resolver:self_heal widget={widget.id} title={widget.title} old={widget.stop_ids} new={resolved_stop_ids}"
+        )
+    return resolved_stop_ids, errors, best_coords if best_coords[0] is not None and best_coords[1] is not None else None
+
+
+def _resolve_gtfs_widget_stop_ids(config: AppConfig, catalog: StopCatalog) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    resolved: dict[str, list[str]] = {}
+    errors: dict[str, list[str]] = {}
+    resolved_points: list[tuple[float, float]] = []
+    pending: list[WidgetConfig] = [widget for widget in config.widgets if widget.source == "gtfs_rt"]
+
+    changed = True
+    while pending and changed:
+        changed = False
+        reference_point = None
+        if resolved_points:
+            reference_point = (
+                sum(lat for lat, _lon in resolved_points) / len(resolved_points),
+                sum(lon for _lat, lon in resolved_points) / len(resolved_points),
+            )
+        next_pending: list[WidgetConfig] = []
+        for widget in pending:
+            selector = _widget_selector(widget)
+            selector_has_coords = bool(selector and selector.latitude is not None and selector.longitude is not None)
+            widget_reference = None
+            if selector_has_coords:
+                widget_reference = None
+            elif reference_point is not None:
+                widget_reference = reference_point
+            resolved_ids, widget_errors, coords = _resolve_widget_stop_ids_from_catalog(widget, catalog, widget_reference)
+            if widget_errors and reference_point is None and not selector_has_coords and len(pending) > 1:
+                next_pending.append(widget)
+                continue
+            resolved[widget.id] = resolved_ids
+            if widget_errors:
+                errors[widget.id] = widget_errors
+            if coords is not None:
+                resolved_points.append(coords)
+            changed = True
+        pending = next_pending
+
+    for widget in pending:
+        resolved_ids, widget_errors, _coords = _resolve_widget_stop_ids_from_catalog(widget, catalog, None)
+        resolved[widget.id] = resolved_ids
+        if widget_errors:
+            errors[widget.id] = widget_errors
+
+    return resolved, errors
 
 
 def find_widget(config: AppConfig, widget_id: str) -> Optional[WidgetConfig]:
@@ -1131,6 +1399,15 @@ def _extract_delay_s(stop_update) -> Optional[int]:
     return None
 
 
+def _schedule_relationship_name(stop_update) -> str:
+    try:
+        return gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.ScheduleRelationship.Name(
+            int(stop_update.schedule_relationship)
+        )
+    except Exception:
+        return "SCHEDULED"
+
+
 def _matches_widget_text_filters(
     widget: WidgetConfig, direction: str, path_stops: Optional[list[str]] = None
 ) -> bool:
@@ -1204,11 +1481,12 @@ def extract_departures(
     route_map: dict[str, str],
     trip_destination_map: dict[str, str],
     now_epoch: int,
-) -> list[Departure]:
+) -> GTFSRealtimeExtractionResult:
     stop_ids = set(widget.stop_ids)
     route_filter = set(widget.route_short_names or [])
     max_time_epoch = now_epoch + max(1, widget.gtfs_lookahead_hours) * 3600
     departures: list[Departure] = []
+    non_scheduled_trip_stops: dict[tuple[str, str], str] = {}
 
     for entity in feed_message.entity:
         if not entity.HasField("trip_update"):
@@ -1229,6 +1507,12 @@ def extract_departures(
         for stop_update in trip_update.stop_time_update:
             stop_id = str(stop_update.stop_id or "").strip()
             if stop_id not in stop_ids:
+                continue
+
+            relationship_name = _schedule_relationship_name(stop_update)
+            if relationship_name == "SKIPPED":
+                if trip_id and stop_id:
+                    non_scheduled_trip_stops[(trip_id, stop_id)] = relationship_name
                 continue
 
             time_epoch = _extract_time_epoch(stop_update)
@@ -1252,11 +1536,15 @@ def extract_departures(
                     in_min=max(0, in_min),
                     delay_s=delay_s,
                     trip_id=trip_id,
+                    scheduled_relationship=None if relationship_name == "SCHEDULED" else relationship_name,
                 )
             )
 
     departures.sort(key=lambda item: item.time_epoch)
-    return departures[: widget.max_departures]
+    return GTFSRealtimeExtractionResult(
+        departures=departures[: widget.max_departures],
+        non_scheduled_trip_stops=non_scheduled_trip_stops,
+    )
 
 
 
@@ -1272,29 +1560,28 @@ def load_static_gtfs_archive_bytes(timeout_seconds: int) -> tuple[Optional[bytes
     )
 
 
-def load_known_stop_ids_from_static_gtfs(timeout_seconds: int) -> tuple[set[str], Optional[str]]:
+def load_stop_catalog_from_static_gtfs(timeout_seconds: int) -> tuple[set[str], Optional[StopCatalog], Optional[str]]:
     started_at = time.monotonic()
     payload, load_error = load_static_gtfs_archive_bytes(timeout_seconds)
     if payload is None:
-        return set(), load_error or "stops index payload unavailable"
+        return set(), None, load_error or "stops index payload unavailable"
 
     try:
-        with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
-            stop_ids: set[str] = set()
-            with archive.open("stops.txt", "r") as handle:
-                reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8", newline=""))
-                for row in reader:
-                    stop_id = str(row.get("stop_id", "")).strip()
-                    if stop_id:
-                        stop_ids.add(stop_id)
+        catalog = _build_stop_catalog(payload)
+        stop_ids = set(catalog.by_id.keys())
         debug_log(
             "mapping_static:stops_indexed "
             f"count={len(stop_ids)} duration_s={time.monotonic() - started_at:.2f}"
         )
-        return stop_ids, None
+        return stop_ids, catalog, None
     except Exception as exc:
         debug_log(f"mapping_static:stops_index_failed error={exc}")
-        return set(), f"stops index parse failed: {exc}"
+        return set(), None, f"stops index parse failed: {exc}"
+
+
+def load_known_stop_ids_from_static_gtfs(timeout_seconds: int) -> tuple[set[str], Optional[str]]:
+    stop_ids, _catalog, load_error = load_stop_catalog_from_static_gtfs(timeout_seconds)
+    return stop_ids, load_error
 
 
 def _parse_gtfs_hms_to_seconds(raw_value: str) -> Optional[int]:
@@ -1815,6 +2102,7 @@ def merge_departures_realtime_with_fallback(
     realtime_departures: list[Departure],
     fallback_departures: list[Departure],
     max_departures: int,
+    non_scheduled_trip_stops: Optional[dict[tuple[str, str], str]] = None,
 ) -> list[Departure]:
     def canonical_trip_id(value: str) -> str:
         trip_id = str(value or "").strip().casefold()
@@ -1830,6 +2118,19 @@ def merge_departures_realtime_with_fallback(
         direction = re.sub(r"\s+", " ", str(dep.direction or "").strip()).casefold()
         stop_id = str(dep.stop_id or "").strip()
         return route, direction, stop_id
+
+    def non_scheduled_relationship_for(dep: Departure) -> Optional[str]:
+        trip_id = str(dep.trip_id or "").strip()
+        stop_id = str(dep.stop_id or "").strip()
+        if not trip_id or not stop_id or not non_scheduled_trip_stops:
+            return None
+        relationship = non_scheduled_trip_stops.get((trip_id, stop_id))
+        if relationship:
+            return relationship
+        canonical = canonical_trip_id(trip_id)
+        if canonical and canonical != trip_id.casefold():
+            return non_scheduled_trip_stops.get((canonical, stop_id))
+        return None
 
     merged: list[Departure] = []
     seen_exact: set[tuple[str, int, str, str]] = set()
@@ -1868,6 +2169,24 @@ def merge_departures_realtime_with_fallback(
             canonical = canonical_trip_id(trip_id)
             if canonical and (canonical, stop_id) in realtime_trip_stop_keys:
                 continue
+
+        relationship = non_scheduled_relationship_for(dep)
+        if relationship == "SKIPPED":
+            exact_key = (dep.trip_id, dep.time_epoch, dep.stop_id, dep.route)
+            if exact_key in seen_exact:
+                continue
+            seen_exact.add(exact_key)
+            merged.append(
+                replace(
+                    dep,
+                    delay_s=None,
+                    cancelled=True,
+                    scheduled_relationship=relationship,
+                )
+            )
+            if len(merged) >= max_departures:
+                break
+            continue
 
         rds_key = route_direction_stop_key(dep)
         # Prefer realtime if the same service is already present with delay-shifted time.
@@ -2060,7 +2379,7 @@ async def reload_mapping_if_due(state: RuntimeState) -> None:
             if mapping_error:
                 mapping_error = f"{mapping_error} | Mapping-Reuse aus Arbeitsspeicher aktiv"
             else:
-                mapping_error = "Mapping-Datei leer/nicht verfuegbar; verwende Mapping aus Arbeitsspeicher"
+                mapping_error = "Mapping-Datei leer/nicht verfügbar; verwende Mapping aus Arbeitsspeicher"
             app_log(
                 "mapping_reload:memory_reuse "
                 f"path={state.config.mapping.trip_route_map_csv} routes={len(route_map)} destinations={len(trip_destination_map)}"
@@ -2118,6 +2437,11 @@ def _build_24h_widget(widget: WidgetConfig) -> WidgetConfig:
     )
 
 
+def _effective_widget_for_runtime(state: RuntimeState, widget: WidgetConfig) -> WidgetConfig:
+    effective_stop_ids = list(state.resolved_stop_ids_by_widget.get(widget.id) or widget.stop_ids)
+    return replace(widget, stop_ids=effective_stop_ids)
+
+
 async def get_widget_departures_for_view(
     state: RuntimeState,
     widget: WidgetConfig,
@@ -2131,6 +2455,8 @@ async def get_widget_departures_for_view(
     async with state.lock:
         direction_labels = dict(state.direction_labels)
         direction_label_patterns = list(state.direction_label_patterns)
+        widget_validation_errors = list(state.stop_validation_errors_by_widget.get(widget.id, []))
+        runtime_widget = _effective_widget_for_runtime(state, widget)
 
     if normalized_mode != "24h":
         async with state.lock:
@@ -2171,6 +2497,7 @@ async def get_widget_departures_for_view(
         async with state.lock:
             realtime_departures = list(state.departures_by_widget.get(widget.id, []))
             errors = list(state.errors_by_widget.get(widget.id, []))
+            gtfs_non_scheduled_trip_stops = dict(state.gtfs_non_scheduled_trip_stops_by_widget.get(widget.id, {}))
             static_fallback_index = state.static_fallback_index
             static_fallback_error = state.static_fallback_error
             static_fallback_task = state.static_fallback_refresh_task
@@ -2178,13 +2505,14 @@ async def get_widget_departures_for_view(
             fetched_at_epoch = state.fetched_at_epoch
 
         if static_fallback_index is not None:
-            widget_24h = _build_24h_widget(widget)
+            widget_24h = _build_24h_widget(runtime_widget)
             fallback_departures = extract_static_schedule_departures(widget_24h, static_fallback_index, now_epoch)
             merged_limit = max(widget_24h.max_departures, len(realtime_departures) + len(fallback_departures))
             departures = merge_departures_realtime_with_fallback(
                 realtime_departures,
                 fallback_departures,
                 merged_limit,
+                gtfs_non_scheduled_trip_stops,
             )
         else:
             departures = realtime_departures
@@ -2200,7 +2528,7 @@ async def get_widget_departures_for_view(
         departures = [dep for dep in departures if now_epoch <= dep.time_epoch <= max_time_epoch]
         departures.sort(key=lambda item: item.time_epoch)
     else:
-        widget_24h = _build_24h_widget(widget)
+        widget_24h = _build_24h_widget(runtime_widget)
         try:
             departures = await fetch_db_iris_departures(widget_24h, state.config.feed.http_timeout_seconds, now_epoch)
             max_time_epoch = now_epoch + 24 * 3600
@@ -2246,10 +2574,18 @@ async def refresh_known_stop_ids_if_due(state: RuntimeState, force: bool = False
         return
 
     started_at = time.monotonic()
-    stop_ids, load_error = await asyncio.to_thread(load_known_stop_ids_from_static_gtfs, timeout_seconds)
+    stop_ids, stop_catalog, load_error = await asyncio.to_thread(load_stop_catalog_from_static_gtfs, timeout_seconds)
+    resolved_stop_ids_by_widget: dict[str, list[str]] = {}
+    stop_validation_errors_by_widget: dict[str, list[str]] = {}
+    if stop_catalog is not None:
+        resolved_stop_ids_by_widget, stop_validation_errors_by_widget = _resolve_gtfs_widget_stop_ids(state.config, stop_catalog)
+
     async with state.lock:
         if stop_ids:
             state.known_stop_ids = set(stop_ids)
+            state.stop_catalog = stop_catalog
+            state.resolved_stop_ids_by_widget = resolved_stop_ids_by_widget
+            state.stop_validation_errors_by_widget = stop_validation_errors_by_widget
             state.known_stop_ids_error = None
         elif load_error:
             state.known_stop_ids_error = load_error
@@ -2258,6 +2594,7 @@ async def refresh_known_stop_ids_if_due(state: RuntimeState, force: bool = False
     debug_log(
         "mapping_static:known_stops_refresh "
         f"loaded={len(stop_ids)} cached_before={cached_count} had_error={bool(load_error)} "
+        f"resolved_widgets={len(resolved_stop_ids_by_widget)} validation_errors={sum(len(items) for items in stop_validation_errors_by_widget.values())} "
         f"next_in_s={reload_in_seconds} duration_s={time.monotonic() - started_at:.2f}"
     )
 
@@ -2308,7 +2645,7 @@ async def refresh_static_fallback_index_if_due(
     force: bool = False,
     wait: bool = False,
 ) -> None:
-    target_stop_ids = all_widget_stop_ids(state.config, source="gtfs_rt")
+    target_stop_ids = all_widget_stop_ids(state, source="gtfs_rt")
     if not target_stop_ids:
         return
 
@@ -2525,6 +2862,16 @@ def build_config_excerpt(config: AppConfig) -> dict:
                 "title": widget.title,
                 "source": widget.source,
                 "stop_ids": widget.stop_ids,
+                "station_selector": (
+                    {
+                        "name": widget.station_selector.name,
+                        "latitude": widget.station_selector.latitude,
+                        "longitude": widget.station_selector.longitude,
+                        "radius_m": widget.station_selector.radius_m,
+                    }
+                    if widget.station_selector is not None
+                    else None
+                ),
                 "db_eva_no": widget.db_eva_no,
                 "direction_contains": widget.direction_contains,
                 "required_stops": widget.required_stops,
@@ -2670,6 +3017,8 @@ def create_app(config: AppConfig) -> FastAPI:
         return HTMLResponse(render_widget_index_html(config, str(request.base_url)))
     async def _build_json_payload(widget: WidgetConfig, view_mode: str) -> dict:
         departures, fetched_at_epoch, errors = await get_widget_departures_for_view(state, widget, view_mode)
+        async with state.lock:
+            resolved_stop_ids = list(state.resolved_stop_ids_by_widget.get(widget.id) or widget.stop_ids)
         return {
             "widget_id": widget.id,
             "widget_title": widget.title,
@@ -2677,6 +3026,7 @@ def create_app(config: AppConfig) -> FastAPI:
             "fetched_at": fetched_at_epoch,
             "age_s": age_seconds(fetched_at_epoch),
             "departures": [dep.to_dict() for dep in departures],
+            "resolved_stop_ids": resolved_stop_ids,
             "errors": errors,
             "app_version": APP_VERSION,
             "widgets": [{"id": w.id, "title": w.title} for w in config.widgets],

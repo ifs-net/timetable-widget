@@ -65,7 +65,7 @@ und eine Datenquelle (`source`).
 
 - Es wird nur noch das Mehrfach-Widget-Format `widgets:` unterstützt.
 - Das frühere Single-Format mit `widget:` und `filter:` ist entfernt.
-- JSON wird pro Widget über `/json/<id>` aufgerufen (z. B. `/json/1`).
+- JSON wird pro Widget über `/json/<id>` aufgerufen, z. B. `/json/1`.
 - Die 24h-Ansicht ist je Widget über `/widget/<id>/24h` und `/json/<id>/24h` erreichbar.
 
 ```yaml
@@ -73,9 +73,8 @@ widgets:
   - id: "1"
     title: "Dechbetten/TELIS FINANZ"
     source: "gtfs_rt"
-    stop_ids:
-      - "27741"   # Dechbetten/TELIS FINANZ (aktive Richtung 1, Regensburg)
-      - "647898"  # Dechbetten/TELIS FINANZ (aktive Richtung 2, Regensburg)
+    station_selector:
+      name: "Dechbetten/TELIS FINANZ"
     gtfs_lookahead_hours: 24
     max_departures: 8
     show_delay: true
@@ -96,28 +95,26 @@ widgets:
   - id: "3"
     title: "Lilienthalstraße"
     source: "gtfs_rt"
-    stop_ids:
-      - "406702"  # Lilienthalstraße (Regensburg, Richtung A)
-      - "8593"    # Lilienthalstraße (Regensburg, Richtung B)
-      - "86805"   # Lilienthalstraße (Regensburg, weitere Steig-/Richtungs-ID)
+    station_selector:
+      name: "Lilienthalstraße"
     gtfs_lookahead_hours: 24
     max_departures: 8
     show_delay: true
     show_feed_age: true
 ```
 
-### Optionen Pro Widget (Pro Linie/Station)
+### Optionen pro Widget
 
 Pflicht je Widget:
 
-- `id`: eindeutige Widget-ID (String), z. B. `"1"`; muss über alle Widgets eindeutig sein.
+- `id`: eindeutige Widget-ID als String, z. B. `"1"`.
 - `title`: frei wählbarer Anzeigename im Widget-Kopf.
-- `source`: Datenquelle, entweder `"gtfs_rt"` oder `"db_iris"`.
+- `source`: Datenquelle, entweder `gtfs_rt` oder `db_iris`.
 
-Allgemeine Optionen (für beide Quellen):
+Allgemeine Optionen:
 
-- `max_departures` (Standard: `8`): maximale Anzahl angezeigter Verbindungen (`>= 1`) in der Standardansicht (`/widget/<id>` und `/json/<id>`).
-- In der 24h-Ansicht (`/widget/<id>/24h`, `/json/<id>/24h`) werden alle Abfahrten der nächsten 24 Stunden geliefert.
+- `max_departures` (Standard: `8`): maximale Anzahl angezeigter Verbindungen in der Standardansicht.
+- In der 24h-Ansicht werden alle Abfahrten der nächsten 24 Stunden geliefert.
 - `show_delay` (Standard: `true`): zeigt die Verspätungsspalte.
 - `show_feed_age` (Standard: `true`): zeigt Feed-Zeitstempel und Alter.
 - `direction_contains` (optional): OR-Filter für Richtung/Laufweg; mindestens ein Begriff muss vorkommen.
@@ -125,15 +122,13 @@ Allgemeine Optionen (für beide Quellen):
 
 GTFS-Widget (`source: "gtfs_rt"`):
 
-- `stop_ids` (wichtig): Liste der Stop-IDs, für die Abfahrten gesucht werden.
+- `station_selector` (empfohlen): fachliche Beschreibung der Haltestelle. Die App sucht daraus beim Laden der statischen GTFS-Daten automatisch die aktuellen Steig-/Stop-IDs.
+- `station_selector.name`: Haltestellenname wie in `stops.txt`.
+- `station_selector.latitude` und `station_selector.longitude` (optional): nur nötig, wenn derselbe Haltestellenname im bundesweiten Feed mehrfach vorkommt und die App ihn nicht eindeutig selbst auflösen kann.
+- `station_selector.radius_m` (Standard: `750`): optionaler Abstandsfilter in Metern, falls Koordinaten gesetzt werden.
+- `stop_ids` (optional, Legacy): manuell hinterlegte Stop-IDs. Sie bleiben als Fallback und Vergleichswert möglich, sollten aber nicht mehr die primäre Konfiguration sein.
 - `route_short_names` (optional): zusätzlicher Linienfilter, z. B. `["4","10"]`.
 - `gtfs_lookahead_hours` (Standard: `24`, Bereich `1..48`): Zeitfenster für zukünftige Abfahrten.
-
-- Wenn Echtzeit weniger als `max_departures` liefert, ergänzt die App weitere Abfahrten aus statischen GTFS-Fahrplänen (ohne Live-Verspätung).
-- Echtzeitdaten haben Priorität; statische Fahrten werden nur ergänzend bis `max_departures` genutzt.
-- Für statische Ergänzungen bleibt `delay_s` leer (`null`), weil dafür keine Live-Verspätung vorliegt.
-- Die Fahrtrichtung im Fallback kommt aus `trip_headsign` aus den GTFS-Static-Daten.
-- Sobald eine passende Echtzeitfahrt vorhanden ist, wird der entsprechende statische Eintrag unterdrückt (auch bei abweichender Minutenlage durch Verspätung).
 
 DB-Widget (`source: "db_iris"`):
 
@@ -144,10 +139,15 @@ DB-Widget (`source: "db_iris"`):
 
 Hinweise zur Wirkung:
 
-- `stop_ids` wird nur bei `gtfs_rt` ausgewertet.
+- `station_selector` wird nur bei `gtfs_rt` ausgewertet und ist die empfohlene Konfigurationsart.
+- Bei jedem internen Reload der statischen GTFS-Daten werden die passenden Stop-IDs neu aufgelöst. Ein Container-Neustart ist dafür nicht nötig.
+- Wenn sich im Feed gültige, aber fachlich falsche Stop-IDs befinden, ersetzt die App diese automatisch durch die zur Haltestelle passenden Werte.
+- `stop_ids` wird nur bei `gtfs_rt` ausgewertet und bleibt als Legacy-Fallback verfügbar.
 - Die Meldung `Falsche Konfiguration: Stop-ID ... nicht gefunden.` basiert auf `stops.txt` aus den statischen GTFS-Daten, nicht auf einem einzelnen Live-Snapshot.
-- Wenn eine Stop-ID im Live-Feed temporär keine Fahrten hat, wird sie dadurch nicht mehr fälschlich als Konfigurationsfehler markiert.
-- `db_eva_no`, `db_only_trains`, `db_use_fchg`, `db_lookahead_hours` werden nur bei `db_iris` ausgewertet.
+- Wenn eine Stop-ID im Live-Feed temporär keine Fahrten hat, wird sie dadurch nicht fälschlich als Konfigurationsfehler markiert.
+- Wenn Echtzeit weniger als `max_departures` liefert, ergänzt die App weitere Abfahrten aus statischen GTFS-Fahrplänen.
+- Wenn GTFS-Realtime einen Halt mit `SKIPPED` meldet, zeigt das Widget diesen Halt als `entfällt` an, statt ihn fälschlich als normale statische Fahrt zu behandeln.
+- `db_eva_no`, `db_only_trains`, `db_use_fchg` und `db_lookahead_hours` werden nur bei `db_iris` ausgewertet.
 - `source` akzeptiert intern auch Aliase (`gtfs`, `gtfs-realtime`, `db`, `db_timetables`), empfohlen sind aber `gtfs_rt` bzw. `db_iris`.
 - Falls ein GTFS-Widget `route_short_names` setzt, aber kein Mapping verfügbar ist, erscheinen dazu klare Fehlhinweise im Widget.
 
@@ -159,7 +159,7 @@ Beispiel in der Mapping-Datei:
 
 ```
 4|Universitaet|VMG
-4|Universit?t|VMG
+4|Universitaet|VMG
 1|Pommernstraße|Stadt/Goethe
 ```
 
@@ -209,6 +209,7 @@ config:
 - Für `source: "gtfs_rt"` wird zuerst ausschließlich aus dem Echtzeit-Feed gelesen.
 - Falls weniger Treffer als `max_departures` vorhanden sind, wird mit statischen GTFS-Fahrplänen bis zum Limit ergänzt.
 - Beim frischen Container-Start kann es in den ersten 1 bis 2 Minuten vorkommen, dass noch nicht alle statischen Ergänzungen sichtbar sind (z. B. fehlende Linien/Fahrtrichtungen). Nach dem ersten vollständigen Refresh ist die Anzeige wieder vollständig.
+- Während eines laufenden Hintergrund-Refreshes bleiben die zuletzt erfolgreich geladenen Daten sichtbar, bis die neue Datenbasis vollständig bereitsteht.
 - In der 24h-Ansicht werden Realtime und statischer Fallback ebenfalls zusammengeführt, aber ohne Begrenzung auf `max_departures`.
 - Die 24h-Berechnung ist serverseitig kurz gecacht (TTL = `feed.refresh_seconds`), damit wiederholte Ajax-Refreshes performant bleiben.
 - Deduplizierung priorisiert Echtzeitdaten. Statische Fahrten werden verworfen, wenn eine passende Live-Fahrt bereits vorhanden ist (über `trip_id+stop_id` sowie zusätzlich Linie/Richtung/Stop im Zeitfenster mit Verspätungsabgleich).
@@ -326,10 +327,10 @@ Empfohlener verifizierter Release-Workflow (PowerShell):
 ```
 
 Der Workflow:
-- baut und pusht Multi-Arch fuer `linux/amd64` und `linux/arm64`
+- baut und pusht Multi-Arch für `linux/amd64` und `linux/arm64`
 - setzt Build-Metadaten (`APP_VERSION`, `APP_GIT_SHA`, `APP_BUILD_DATE`)
-- prueft, ob `latest` auf denselben Digest wie `<version>` zeigt
-- prueft, ob sich der `latest`-Digest gegenueber vorher geaendert hat
+- prüft, ob `latest` auf denselben Digest wie `<version>` zeigt
+- prüft, ob sich der `latest`-Digest gegenüber vorher geändert hat
 
 Manueller Fallback mit Build-Metadaten:
 
@@ -412,12 +413,7 @@ Bitte bezüglich des eigenen Einsatzes selbst jeweils die rechtlichen Rahmenbedi
 ## Warmup beim Start
 
 - `WARMUP_STATIC_CACHE_ON_START=1` (Standard in Compose): lädt beim Start den GTFS-Static-Cache (`/tmp/nv_free_latest.zip`) vor.
-- Zusätzlich wird beim Start der statische Fallback-Index für konfigurierte GTFS-Stop-IDs aufgebaut.
+- Zusätzlich wird beim Start der statische Fallback-Index für konfigurierte GTFS-Haltestellen aufgebaut.
 - Vorteil: Der erste Widget-Aufruf muss den großen Static-Download nicht mehr selbst auslösen.
 - `WARMUP_ON_START=1` (optional): führt zusätzlich einen kompletten Daten-Warmup aus.
 - Hinweis: Warmup verlagert Wartezeit auf den Container-Start und kann den Start verlangsamen.
-
-
-
-
-

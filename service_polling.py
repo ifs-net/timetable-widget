@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Optional
 
 from google.transit import gtfs_realtime_pb2
@@ -21,7 +21,7 @@ class PollingDeps:
     load_trip_maps_for_trip_ids_from_static_gtfs: Callable[[set[str], dict[str, str], int], tuple[dict[str, str], dict[str, str], Optional[str]]]
     persist_trip_maps_to_csv: Callable[[str, dict[str, str], dict[str, str]], None]
     refresh_static_fallback_index_if_due: Callable[[Any], Awaitable[None]]
-    extract_departures: Callable[[Any, Any, dict[str, str], dict[str, str], int], list[Any]]
+    extract_departures: Callable[[Any, Any, dict[str, str], dict[str, str], int], Any]
     extract_static_schedule_departures: Callable[[Any, Any, int], list[Any]]
     merge_departures_realtime_with_fallback: Callable[[list[Any], list[Any], int], list[Any]]
     apply_direction_labels: Callable[[list[Any], dict[str, str], list[tuple[str, str, str]]], dict[tuple[str, str], tuple[str, str]]]
@@ -75,6 +75,7 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
 
     departures_by_widget: dict[str, list[Any]] = {widget.id: [] for widget in state.config.widgets}
     errors_by_widget: dict[str, list[str]] = {widget.id: [] for widget in state.config.widgets}
+    gtfs_non_scheduled_trip_stops_by_widget: dict[str, dict[tuple[str, str], str]] = {}
     total_departures = 0
 
     if gtfs_widgets:
@@ -91,16 +92,17 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
             feed_message.ParseFromString(feed_bytes)
             parse_elapsed = time.monotonic() - parse_started
 
-            configured_stop_ids = set(deps.all_widget_stop_ids(state.config, source="gtfs_rt"))
-            if had_cached_data:
-                await deps.refresh_known_stop_ids_if_due(state)
-                async with state.lock:
-                    known_stop_ids = set(state.known_stop_ids)
-                    known_stop_ids_error = state.known_stop_ids_error
-            else:
-                known_stop_ids = set()
-                known_stop_ids_error = None
-                deps.debug_log("poll_once:skip_known_stop_validation_cold_start")
+            await deps.refresh_known_stop_ids_if_due(state)
+            async with state.lock:
+                known_stop_ids = set(state.known_stop_ids)
+                known_stop_ids_error = state.known_stop_ids_error
+                resolved_stop_ids_by_widget = {
+                    key: list(value) for key, value in getattr(state, "resolved_stop_ids_by_widget", {}).items()
+                }
+                stop_validation_errors_by_widget = {
+                    key: list(value) for key, value in getattr(state, "stop_validation_errors_by_widget", {}).items()
+                }
+            configured_stop_ids = set(deps.all_widget_stop_ids(state, source="gtfs_rt"))
 
             deps.debug_log(
                 "poll_once:gtfs_feed_ready "
@@ -180,28 +182,41 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
             for widget in gtfs_widgets:
                 widget_started = time.monotonic()
                 widget_errors = errors_by_widget[widget.id]
+                effective_stop_ids = list(resolved_stop_ids_by_widget.get(widget.id) or widget.stop_ids)
+                runtime_widget = replace(widget, stop_ids=effective_stop_ids)
+                widget_errors.extend(stop_validation_errors_by_widget.get(widget.id, []))
                 if mapping_error:
                     widget_errors.append(mapping_error)
-                if not widget.stop_ids:
-                    widget_errors.append(f"Widget {widget.id}: stop_ids ist leer; keine Treffer möglich.")
+                if not runtime_widget.stop_ids:
+                    widget_errors.append(f"Widget {widget.id}: keine auflösbaren Stop-IDs vorhanden.")
+                    widget_durations[widget.id] = time.monotonic() - widget_started
+                    continue
                 if widget.route_short_names and not route_map:
                     widget_errors.append(
                         f"Widget {widget.id}: route_short_names ist gesetzt, aber Mapping ist leer/nicht verfügbar."
                     )
                 if not known_stop_ids and known_stop_ids_error:
                     widget_errors.append(f"Stop-ID-Validierung aktuell nicht verfügbar: {known_stop_ids_error}")
-                for stop_id in widget.stop_ids:
+                for stop_id in runtime_widget.stop_ids:
                     if known_stop_ids and stop_id not in known_stop_ids:
                         widget_errors.append(f"Falsche Konfiguration: Stop-ID {stop_id} nicht gefunden.")
 
-                departures = deps.extract_departures(feed_message, widget, route_map, trip_destination_map, now_epoch)
+                extraction_result = deps.extract_departures(
+                    feed_message,
+                    runtime_widget,
+                    route_map,
+                    trip_destination_map,
+                    now_epoch,
+                )
+                departures = list(extraction_result.departures)
+                non_scheduled_trip_stops = dict(extraction_result.non_scheduled_trip_stops)
                 realtime_count = len(departures)
 
-                if realtime_count < widget.max_departures and widget.stop_ids:
-                    if (not had_cached_data) and realtime_count > 0:
+                if realtime_count < runtime_widget.max_departures and runtime_widget.stop_ids:
+                    if (not had_cached_data) and realtime_count > 0 and not non_scheduled_trip_stops:
                         deps.debug_log(
                             "poll_once:gtfs_fallback_skipped_cold_start "
-                            f"widget={widget.id} realtime={realtime_count} max={widget.max_departures}"
+                            f"widget={widget.id} realtime={realtime_count} max={runtime_widget.max_departures}"
                         )
                     else:
                         if not static_fallback_loaded:
@@ -214,16 +229,17 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
                             static_fallback_loaded = True
 
                         if static_fallback_index is not None:
-                            fallback_departures = deps.extract_static_schedule_departures(widget, static_fallback_index, now_epoch)
+                            fallback_departures = deps.extract_static_schedule_departures(runtime_widget, static_fallback_index, now_epoch)
                             departures = deps.merge_departures_realtime_with_fallback(
                                 departures,
                                 fallback_departures,
-                                widget.max_departures,
+                                runtime_widget.max_departures,
+                                non_scheduled_trip_stops,
                             )
                             deps.debug_log(
                                 "poll_once:gtfs_fallback "
                                 f"widget={widget.id} realtime={realtime_count} fallback_candidates={len(fallback_departures)} "
-                                f"merged={len(departures)}"
+                                f"non_scheduled={len(non_scheduled_trip_stops)} merged={len(departures)}"
                             )
                         elif static_fallback_error and realtime_count == 0:
                             widget_errors.append(f"Statischer Fahrplan-Fallback nicht verfügbar: {static_fallback_error}")
@@ -234,6 +250,7 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
                     deps.apply_direction_labels(departures, direction_labels, direction_label_patterns)
                 )
                 departures_by_widget[widget.id] = departures
+                gtfs_non_scheduled_trip_stops_by_widget[widget.id] = non_scheduled_trip_stops
                 total_departures += len(departures)
                 deps.debug_log(
                     "poll_once:gtfs_widget_done "
@@ -275,6 +292,7 @@ async def poll_once(state: Any, deps: PollingDeps) -> None:
         state.departures_by_widget = departures_by_widget
         state.fetched_at_epoch = now_epoch
         state.errors_by_widget = errors_by_widget
+        state.gtfs_non_scheduled_trip_stops_by_widget = gtfs_non_scheduled_trip_stops_by_widget
         state.extended_departures_cache = {}
         state.next_refresh_due_monotonic = time.monotonic() + state.config.feed.refresh_seconds
     deps.app_log(

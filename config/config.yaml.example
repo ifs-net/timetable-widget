@@ -1,4 +1,4 @@
-server:
+﻿server:
   host: "0.0.0.0"
   port: 8000
 
@@ -6,7 +6,6 @@ feed:
   url: "https://realtime.gtfs.de/realtime-free.pb"
   refresh_seconds: 30
   http_timeout_seconds: 15
-
 debug:
   enabled: false
   log_path: "/logs/logfile.txt"
@@ -15,9 +14,8 @@ widgets:
   - id: "1"
     title: "Dechbetten/TELIS FINANZ"
     source: "gtfs_rt"
-    stop_ids:
-      - "27741"   # Dechbetten/TELIS FINANZ (aktive Richtung 1, Regensburg)
-      - "647898"  # Dechbetten/TELIS FINANZ (aktive Richtung 2, Regensburg)
+    station_selector:
+      name: "Dechbetten/TELIS FINANZ"  # bevorzugte GTFS-Konfiguration, Stop-IDs werden automatisch aufgelöst
     gtfs_lookahead_hours: 24
     max_departures: 8
     show_delay: true
@@ -38,10 +36,8 @@ widgets:
   - id: "3"
     title: "Lilienthalstraße"
     source: "gtfs_rt"
-    stop_ids:
-      - "406702"  # Lilienthalstraße (Regensburg, Richtung A)
-      - "8593"    # Lilienthalstraße (Regensburg, Richtung B)
-      - "86805"   # Lilienthalstraße (Regensburg, weitere Steig-/Richtungs-ID)
+    station_selector:
+      name: "Lilienthalstraße"
     gtfs_lookahead_hours: 24
     max_departures: 8
     show_delay: true
@@ -50,4 +46,3 @@ widgets:
 mapping:
   trip_route_map_csv: "/data/trip_route_map.csv"
   reload_every_seconds: 300
-
